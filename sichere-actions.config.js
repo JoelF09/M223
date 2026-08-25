@@ -15,7 +15,6 @@ import {
   conflict,
   custom,
   defineApp,
-  notExists,
   now,
   param,
 } from 'sichere-express-actions';
@@ -174,6 +173,27 @@ export default defineApp({
         },
       ],
     },
+
+    // Auftrag 6, Teil A: eigenes Protokoll statt des eingebauten
+    // "_sichere_audit" - damit Tabelle und Spalten dem Auftragstext
+    // entsprechen. feld/alter_wert/neuer_wert kommen laut Auftrag erst
+    // spaeter dazu, deshalb noch nicht hier.
+    protokoll: {
+      label: 'Protokoll',
+      pluralLabel: 'Protokoll',
+      operations: {
+        list: true, get: true, create: false, update: false, delete: false,
+      },
+      documentation: { hidden: true },
+      permissions: { read: ['mitarbeiter', 'admin'] },
+      fields: {
+        tabelle: { type: 'string', required: true },
+        datensatzId: { type: 'string', required: true },
+        aktion: { type: 'string', required: true },
+        accountId: 'ref:account!',
+        zeitpunkt: { type: 'datetime', required: true },
+      },
+    },
   },
 
   // "login" entsteht automatisch aus dem auth-Block oben (POST /api/login) -
@@ -184,8 +204,15 @@ export default defineApp({
     //   lock: true auf autoId serialisiert Anfragen zum selben Auto,
     //   transaction: true haelt Pruefung, INSERT und Protokolleintrag in
     //     einer Transaktion (siehe Thema6-Transaktionen.md, Teil C),
-    //   notExists ist die fachliche Regel selbst, lesbar als Bedingung.
-    vermieten: ({ resources }) => ({
+    //   die Pruefung in execute() ist die fachliche Regel selbst.
+    //
+    // Auftrag 6: die drei Schritte (pruefen, erstelleVermietung,
+    // schreibeProtokoll) stehen bewusst als eigene execute()-Funktion da,
+    // statt als require()/create()/audit()-Kurzform - so ist Teil A/B (die
+    // Schritte einzeln, noch ohne Transaktion) und Teil C (dieselben
+    // Schritte in db.transaction()) am Code sichtbar derselbe Ablauf, nur
+    // mit/ohne die Klammer "transaction: true" darum.
+    vermieten: () => ({
       method: 'post',
       path: '/vermietungen',
       input: {
@@ -195,33 +222,44 @@ export default defineApp({
         kundeId: { ref: 'kunde', required: true, label: 'Kunde' },
       },
       roles: ['mitarbeiter', 'admin'],
-      // TEIL C: alle Schritte (Pruefung, Anlegen, Protokolleintrag) laufen
-      // gemeinsam in db.transaction() - siehe Thema6-Transaktionen.md.
+      // TEIL C: alle drei Schritte unten laufen gemeinsam in
+      // db.transaction() - siehe Thema6-Transaktionen.md.
       transaction: true,
-      require: [
-        custom(
-          async ({ input, repositories }) => (
-            await repositories.auto.findById(input.autoId)
-          )?.status === 'verfuegbar',
-          { error: conflict('Dieses Auto ist derzeit nicht verfuegbar') },
-        ),
-        notExists({
-          resource: resources.vermietung,
-          where: ({ autoId }) => ({ autoId, zurueckgegebenAm: null }),
-          error: conflict('Dieses Auto ist bereits vermietet'),
-        }),
-      ],
-      // Schritt "erstelleVermietung()".
-      create: {
-        resource: 'vermietung',
-        values: ({ input }) => ({
-          ...input, status: 'offen', ausgeliehenAm: now(), zurueckgegebenAm: null,
-        }),
+      execute: async ({ input, repositories, user }) => {
+        // Schritt 1: pruefen - bewusst *innerhalb* der Transaktion (siehe
+        // Tipp im Auftrag): ausserhalb wuerde zwischen Pruefung und Anlegen
+        // wieder ein Fenster fuer die Race Condition entstehen.
+        const auto = await repositories.auto.findById(input.autoId);
+        if (auto?.status !== 'verfuegbar') throw conflict('Dieses Auto ist derzeit nicht verfuegbar');
+        const offeneVermietung = await repositories.vermietung.findOne({
+          autoId: input.autoId, zurueckgegebenAm: null,
+        });
+        if (offeneVermietung) throw conflict('Dieses Auto ist bereits vermietet');
+
+        // Schritt 2: erstelleVermietung() - createdAt/createdBy von Hand
+        // gesetzt, weil execute() (anders als die require()/create()-Kurzform)
+        // das automatische tracking: { actorResource: 'account' } umgeht.
+        const vermietung = await repositories.vermietung.create({
+          autoId: input.autoId,
+          kundeId: input.kundeId,
+          status: 'offen',
+          ausgeliehenAm: now(),
+          zurueckgegebenAm: null,
+          createdAt: now(),
+          createdBy: user.id,
+        });
+
+        // Schritt 3: schreibeProtokoll()
+        await repositories.protokoll.create({
+          tabelle: 'vermietung',
+          datensatzId: String(vermietung.id),
+          aktion: 'vermieten',
+          accountId: user.id,
+          zeitpunkt: now(),
+        });
+
+        return vermietung;
       },
-      // Schritt "schreibeProtokoll()": schreibt in die Tabelle
-      // "_sichere_audit" (das Protokoll aus Teil A - siehe
-      // Thema6-Transaktionen.md).
-      audit: { action: 'vermietung.vermieten' },
       publish: ({ result }) => ({
         topic: 'vermietung.changed', data: { operation: 'create', resource: 'vermietung', value: result },
       }),
