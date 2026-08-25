@@ -12,7 +12,8 @@
     "seed": "sichere-actions seed --reset",
     "test": "sichere-actions test",
     "db:update": "sichere-actions migration:create --name update && sichere-actions migration:run",
-    "docs": "sichere-actions docs"
+    "docs": "sichere-actions docs",
+    "sql": "sichere-actions sql"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",

@@ -182,7 +182,8 @@ export default defineApp({
     // Die Race Condition ("zwei Anfragen vermieten gleichzeitig dasselbe
     // Auto") wird an drei Stellen gleichzeitig geschlossen:
     //   lock: true auf autoId serialisiert Anfragen zum selben Auto,
-    //   transaction: true haelt Pruefung und INSERT in einer Transaktion,
+    //   transaction: true haelt Pruefung, INSERT und Protokolleintrag in
+    //     einer Transaktion (siehe Thema6-Transaktionen.md, Teil C),
     //   notExists ist die fachliche Regel selbst, lesbar als Bedingung.
     vermieten: ({ resources }) => ({
       method: 'post',
@@ -194,6 +195,8 @@ export default defineApp({
         kundeId: { ref: 'kunde', required: true, label: 'Kunde' },
       },
       roles: ['mitarbeiter', 'admin'],
+      // TEIL C: alle Schritte (Pruefung, Anlegen, Protokolleintrag) laufen
+      // gemeinsam in db.transaction() - siehe Thema6-Transaktionen.md.
       transaction: true,
       require: [
         custom(
@@ -208,12 +211,17 @@ export default defineApp({
           error: conflict('Dieses Auto ist bereits vermietet'),
         }),
       ],
+      // Schritt "erstelleVermietung()".
       create: {
         resource: 'vermietung',
         values: ({ input }) => ({
           ...input, status: 'offen', ausgeliehenAm: now(), zurueckgegebenAm: null,
         }),
       },
+      // Schritt "schreibeProtokoll()": schreibt in die Tabelle
+      // "_sichere_audit" (das Protokoll aus Teil A - siehe
+      // Thema6-Transaktionen.md).
+      audit: { action: 'vermietung.vermieten' },
       publish: ({ result }) => ({
         topic: 'vermietung.changed', data: { operation: 'create', resource: 'vermietung', value: result },
       }),
