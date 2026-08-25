@@ -125,10 +125,41 @@ export default defineApp({
       path: '/vermietungen',
       // Angelegt wird ausschliesslich ueber die Action "vermieten" weiter
       // unten - eine Vermietung ist ein Vorgang mit Vorbedingung (Auto muss
-      // frei sein), kein einfacher Datensatz.
-      operations: { list: true, get: true, create: false, update: false, delete: false },
+      // frei sein), kein einfacher Datensatz. update:true ab hier nur fuer
+      // Auftrag 7 (PUT mit Versionspruefung) - schreibbar bleibt ueber die
+      // generierte PUT-Route einzig kundeId (siehe readonly-Felder unten).
+      operations: { list: true, get: true, create: false, update: true, delete: false },
+      permissions: { update: ['mitarbeiter', 'admin'] },
       audit: true,
       live: true,
+      // Auftrag 7, Teil A: optimistisches Sperren. "version" wird von der
+      // Framework-Resource selbst ergaenzt (int, generated, default 1) und
+      // bei jedem Update via "WHERE id=? AND version=?" geprueft - genau das
+      // Muster aus Thema7-Sperrstrategien.md. Bei 0 betroffenen Zeilen
+      // unterscheidet die Resource-Service-Schicht selbst zwischen
+      // "Datensatz existiert nicht" (404) und "Version veraltet" (409 mit
+      // aktueller Version/Zeitpunkt/Daten) - das ist die Stelle aus dem
+      // Auftrag, an der es sonst am haeufigsten hakt.
+      optimisticLock: true,
+      // Auftrag 7, Teil C: pessimistisches Sperren. gesperrtVon/gesperrtAm
+      // werden als Spalten "gesperrt_von"/"gesperrt_am" ergaenzt (FK auf
+      // account). POST .../sperren und POST .../entsperren entstehen daraus
+      // automatisch; eine fremde, noch gueltige Sperre fuehrt beim Sperren
+      // *und* beim naechsten PUT zu 423 samt Name (actorDisplay: 'name') und
+      // Sperrzeitpunkt. ttl: '10m' ist die Ablaufzeit aus Schritt 12 - ohne
+      // sie bliebe eine Vermietung fuer immer blockiert, sobald jemand den
+      // Browser zuklappt. overrideRoles ist standardmaessig schon ['admin'].
+      editingLock: {
+        actorField: 'gesperrtVon',
+        atField: 'gesperrtAm',
+        actorResource: 'account',
+        actorDisplay: 'name',
+        roles: ['mitarbeiter', 'admin'],
+        ttl: '10m',
+        acquirePath: '/sperren',
+        releasePath: '/entsperren',
+        releaseMethod: 'post',
+      },
       // Ersetzt die von Hand gepflegten Felder accountId/erstelltVon/
       // geaendertAm: tracking traegt "wer hat angelegt/zuletzt geaendert"
       // automatisch bei jedem Schreibzugriff nach - aus dem angemeldeten
@@ -155,11 +186,17 @@ export default defineApp({
       // ueber die Action "unfallMelden" (schreibt zusammen mit auto.status in
       // derselben Transaktion) - deshalb hier von Hand als Enum deklariert,
       // ergaenzend zu den beiden Workflow-Zustaenden.
+      // autoId/zurueckgegebenAm sind readonly: die generierte PUT-Route darf
+      // nur kundeId (+ version) aendern - welches Auto und ob zurueckgegeben
+      // wurde, laeuft ausschliesslich ueber vermieten() bzw. die
+      // rueckgabe-Transition, nicht per freiem Update.
       fields: {
-        autoId: 'ref:auto!',
+        autoId: { ref: 'auto', required: true, readonly: true },
         kundeId: 'ref:kunde!',
         ausgeliehenAm: { type: 'datetime', required: true, readonly: true },
-        zurueckgegebenAm: { type: 'datetime', optional: true, nullable: true },
+        zurueckgegebenAm: {
+          type: 'datetime', optional: true, nullable: true, readonly: true,
+        },
         status: {
           enum: ['offen', 'abgeschlossen', 'unfall'], default: 'offen', readonly: true, filterable: true,
         },
