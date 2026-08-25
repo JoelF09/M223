@@ -1,0 +1,298 @@
+// Die gesamte fachliche Anwendung. Datenbank, REST-API, Rechte, Validierung,
+// Konfliktschutz, Nachvollziehbarkeit und das React-Frontend werden daraus
+// abgeleitet - es gibt keine weitere Quelle fuer das Modell.
+//
+// Frueher war dasselbe Fachmodell auf backend/ (fuenf Schichten,
+// handgeschriebener Server, eigene React-Komponenten) und frontend/ verteilt.
+// Diese Datei ersetzt das vollstaendig; die alte Version liegt unveraendert
+// in _manuelle-vorversion/ (siehe README dort).
+//
+// Start: npm install, dann npm run dev - http://localhost:5173
+
+import Driver from 'better-sqlite3';
+import { fileURLToPath } from 'node:url';
+import {
+  conflict,
+  custom,
+  defineApp,
+  notExists,
+  now,
+  param,
+} from 'sichere-express-actions';
+import { SQLiteAuditAdapter, sqlite } from 'sichere-express-actions/sqlite';
+
+// better-sqlite3 statt des eingebauten node:sqlite: Letzteres ist in Node 22
+// noch experimentell und meldet das bei jedem Start.
+const dbDatei = fileURLToPath(new URL('./data.db', import.meta.url));
+const database = sqlite(dbDatei, { driver: new Driver(dbDatei) });
+
+export default defineApp({
+  name: 'Autovermietung Flughafen',
+  database,
+  audit: new SQLiteAuditAdapter(database),
+  api: { prefix: '/api' },
+  ui: { generated: true, title: 'Autovermietung Flughafen', port: 5173 },
+  migrations: { directory: fileURLToPath(new URL('./migrations', import.meta.url)) },
+  documentation: {
+    title: 'Autovermietung Flughafen',
+    directory: fileURLToPath(new URL('./docs/generated', import.meta.url)),
+  },
+
+  // Der Header, ueber den sich Hans, Paul und die Administration ausweisen
+  // (x-account-id, Standardwert), kommt vom generierten Login-Formular selbst
+  // - keine eigene Anmeldeseite noetig.
+  auth: {
+    resource: 'account',
+    username: 'benutzername',
+    password: 'passwort',
+    role: 'gruppe',
+  },
+
+  resources: {
+    // Konten legt niemand ueber die API an - das macht ausschliesslich der
+    // Seed. documentation.hidden blendet die eigene Navigation aus; lesbar
+    // bleibt die Resource trotzdem, damit "Erfasst von" in der
+    // Vermietungsliste einen Namen statt nur eine ID zeigt.
+    // Kein eigener "path" hier: documentation.hidden nimmt account aus der
+    // Liste, die das generierte Frontend zur Pfadauflösung von
+    // Referenzfeldern (z. B. vermietung.createdBy) benutzt - danach faellt es
+    // auf den Resourcennamen als Pfad zurueck. Ein eigener path wuerde davon
+    // abweichen und zu einem 404 fuehren.
+    account: {
+      operations: { list: true, get: true, create: false, update: false, delete: false },
+      documentation: { hidden: true },
+      permissions: { read: ['mitarbeiter', 'admin'] },
+      fields: {
+        benutzername: { type: 'string', required: true, unique: true, min: 3 },
+        passwort: { type: 'string', required: true, sensitive: true, min: 4 },
+        name: 'string!',
+        station: 'string',
+        gruppe: ['mitarbeiter', 'admin'],
+      },
+    },
+
+    kunde: {
+      label: 'Kunde',
+      pluralLabel: 'Kunden',
+      path: '/kunden',
+      display: ['vorname', 'nachname'],
+      defaultSort: 'nachname',
+      audit: true,
+      live: true,
+      optimisticLock: true,
+      permissions: {
+        create: ['mitarbeiter', 'admin'],
+        update: ['mitarbeiter', 'admin'],
+        delete: ['admin'],
+      },
+      fields: {
+        vorname: { type: 'string', required: true, min: 2 },
+        nachname: { type: 'string', required: true, min: 2 },
+      },
+    },
+
+    auto: {
+      label: 'Auto',
+      pluralLabel: 'Autos',
+      path: '/autos',
+      display: '{marke} {modell} ({kennzeichen})',
+      defaultSort: 'kennzeichen',
+      audit: true,
+      live: true,
+      permissions: { create: ['admin'], update: ['admin'], delete: ['admin'] },
+      // Ersetzt das fruehere Statusfeld mit Default+readonly von Hand: Der
+      // Workflow legt "status" selbst als Enum an, setzt "verfuegbar" als
+      // Startwert und generiert aus der Transition eine eigene Route samt
+      // Knopf im Frontend - erscheint automatisch, sobald ein Auto "defekt"
+      // ist und die angemeldete Person Admin ist.
+      workflow: {
+        initial: 'verfuegbar',
+        transitions: {
+          freigeben: {
+            from: 'defekt', to: 'verfuegbar', roles: ['admin'], label: 'Wieder freigeben',
+          },
+        },
+      },
+      fields: {
+        marke: { type: 'string', required: true, min: 2 },
+        modell: { type: 'string', required: true, min: 1 },
+        kennzeichen: { type: 'string', required: true, unique: true },
+      },
+    },
+
+    vermietung: {
+      label: 'Vermietung',
+      pluralLabel: 'Vermietungen',
+      path: '/vermietungen',
+      // Angelegt wird ausschliesslich ueber die Action "vermieten" weiter
+      // unten - eine Vermietung ist ein Vorgang mit Vorbedingung (Auto muss
+      // frei sein), kein einfacher Datensatz.
+      operations: { list: true, get: true, create: false, update: false, delete: false },
+      audit: true,
+      live: true,
+      // Ersetzt die von Hand gepflegten Felder accountId/erstelltVon/
+      // geaendertAm: tracking traegt "wer hat angelegt/zuletzt geaendert"
+      // automatisch bei jedem Schreibzugriff nach - aus dem angemeldeten
+      // Benutzer, nicht aus dem Formular.
+      tracking: { actorResource: 'account' },
+      // "Zurueckgeben" ist eine Workflow-Transition statt einer eigenen
+      // Action: Sie erzeugt POST /api/vermietungen/:id/rueckgabe von selbst
+      // und im generierten Frontend erscheint der Knopf automatisch bei
+      // jeder Vermietung mit Status "offen".
+      workflow: {
+        field: 'status',
+        initial: 'offen',
+        transitions: {
+          rueckgabe: {
+            from: 'offen',
+            to: 'abgeschlossen',
+            roles: ['mitarbeiter', 'admin'],
+            label: 'Zurückgeben',
+            values: () => ({ zurueckgegebenAm: now() }),
+          },
+        },
+      },
+      // "unfall" erreicht dieses Feld nicht ueber eine Transition, sondern
+      // ueber die Action "unfallMelden" (schreibt zusammen mit auto.status in
+      // derselben Transaktion) - deshalb hier von Hand als Enum deklariert,
+      // ergaenzend zu den beiden Workflow-Zustaenden.
+      fields: {
+        autoId: 'ref:auto!',
+        kundeId: 'ref:kunde!',
+        ausgeliehenAm: { type: 'datetime', required: true, readonly: true },
+        zurueckgegebenAm: { type: 'datetime', optional: true, nullable: true },
+        status: {
+          enum: ['offen', 'abgeschlossen', 'unfall'], default: 'offen', readonly: true, filterable: true,
+        },
+      },
+      // Ersetzt den fruehen manuellen SQL-Index in domain/vermietung.js: ein
+      // Auto darf hoechstens eine offene (zurueckgegebenAm IS NULL)
+      // Vermietung gleichzeitig haben.
+      indexes: [
+        {
+          name: 'auto_nur_einmal_offen', fields: ['autoId'], unique: true, where: { zurueckgegebenAm: null },
+        },
+      ],
+    },
+  },
+
+  // "login" entsteht automatisch aus dem auth-Block oben (POST /api/login) -
+  // keine eigene Action noetig.
+  actions: {
+    // Die Race Condition ("zwei Anfragen vermieten gleichzeitig dasselbe
+    // Auto") wird an drei Stellen gleichzeitig geschlossen:
+    //   lock: true auf autoId serialisiert Anfragen zum selben Auto,
+    //   transaction: true haelt Pruefung und INSERT in einer Transaktion,
+    //   notExists ist die fachliche Regel selbst, lesbar als Bedingung.
+    vermieten: ({ resources }) => ({
+      method: 'post',
+      path: '/vermietungen',
+      input: {
+        autoId: {
+          ref: 'auto', required: true, lock: true, label: 'Auto',
+        },
+        kundeId: { ref: 'kunde', required: true, label: 'Kunde' },
+      },
+      roles: ['mitarbeiter', 'admin'],
+      transaction: true,
+      require: [
+        custom(
+          async ({ input, repositories }) => (
+            await repositories.auto.findById(input.autoId)
+          )?.status === 'verfuegbar',
+          { error: conflict('Dieses Auto ist derzeit nicht verfuegbar') },
+        ),
+        notExists({
+          resource: resources.vermietung,
+          where: ({ autoId }) => ({ autoId, zurueckgegebenAm: null }),
+          error: conflict('Dieses Auto ist bereits vermietet'),
+        }),
+      ],
+      create: {
+        resource: 'vermietung',
+        values: ({ input }) => ({
+          ...input, status: 'offen', ausgeliehenAm: now(), zurueckgegebenAm: null,
+        }),
+      },
+      publish: ({ result }) => ({
+        topic: 'vermietung.changed', data: { operation: 'create', resource: 'vermietung', value: result },
+      }),
+      successStatus: 201,
+    }),
+
+    // Zwei Schreibvorgaenge, die zusammengehoeren: die offene Vermietung
+    // dieses Autos (falls vorhanden) wird mit Status "unfall" geschlossen,
+    // und das Auto selbst wird "defekt". Deshalb eine eigene Action statt
+    // einer Workflow-Transition, die immer nur eine Resource aendert.
+    unfallMelden: () => ({
+      method: 'post',
+      path: '/autos/:id/unfall',
+      input: {
+        autoId: {
+          ref: 'auto', required: true, source: param('id'), lock: true, label: 'Auto',
+        },
+      },
+      roles: ['mitarbeiter', 'admin'],
+      transaction: true,
+      require: [
+        custom(
+          async ({ input, repositories }) => (
+            await repositories.auto.findById(input.autoId)
+          )?.status !== 'defekt',
+          { error: conflict('Auto ist bereits als defekt gemeldet') },
+        ),
+      ],
+      execute: async ({ input, repositories }) => {
+        const laufend = await repositories.vermietung.findOne({ autoId: input.autoId, zurueckgegebenAm: null });
+        const vermietung = laufend
+          ? await repositories.vermietung.update(laufend.id, { zurueckgegebenAm: now(), status: 'unfall' })
+          : null;
+        const auto = await repositories.auto.update(input.autoId, { status: 'defekt' });
+        return { id: auto.id, auto, vermietung };
+      },
+      publish: ({ result }) => ({
+        topic: 'auto.changed', data: { operation: 'update', resource: 'auto', value: result.auto },
+      }),
+    }),
+  },
+
+  seed: {
+    account: [
+      {
+        benutzername: 'hans', passwort: '1234', name: 'Hans Meier', station: 'Flughafen Schalter 1', gruppe: 'mitarbeiter',
+      },
+      {
+        benutzername: 'paul', passwort: '1234', name: 'Paul Weber', station: 'Flughafen Schalter 2', gruppe: 'mitarbeiter',
+      },
+      {
+        benutzername: 'admin', passwort: '1234', name: 'Admin Person', station: 'Zentrale', gruppe: 'admin',
+      },
+    ],
+    kunde: [
+      { vorname: 'Anna', nachname: 'Keller' },
+      { vorname: 'Bruno', nachname: 'Steiner' },
+      { vorname: 'Carla', nachname: 'Frei' },
+    ],
+    auto: [
+      { marke: 'VW', modell: 'Golf', kennzeichen: 'ZH 100 001' },
+      { marke: 'Skoda', modell: 'Octavia', kennzeichen: 'ZH 100 002' },
+      { marke: 'Fiat', modell: 'Panda', kennzeichen: 'ZH 100 003' },
+    ],
+    // Als Funktion, damit die IDs der oben angelegten Datensaetze nachgeschlagen
+    // werden koennen, statt sie als "1", "1" zu erraten.
+    vermietung: async ({ repositories }) => {
+      const golf = await repositories.auto.findOne({ kennzeichen: 'ZH 100 001' });
+      const anna = await repositories.kunde.findOne({ vorname: 'Anna', nachname: 'Keller' });
+      const hans = await repositories.account.findOne({ benutzername: 'hans' });
+      const jetzt = new Date().toISOString();
+      return [{
+        autoId: golf.id,
+        kundeId: anna.id,
+        createdBy: hans.id,
+        status: 'offen',
+        ausgeliehenAm: jetzt,
+        zurueckgegebenAm: null,
+      }];
+    },
+  },
+});

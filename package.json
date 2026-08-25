@@ -1,0 +1,28 @@
+{
+  "name": "template-projekt",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "sichere-actions dev",
+    "start": "sichere-actions dev",
+    "build": "sichere-actions build",
+    "seed": "sichere-actions seed --reset",
+    "test": "sichere-actions test",
+    "db:update": "sichere-actions migration:create --name update && sichere-actions migration:run",
+    "docs": "sichere-actions docs"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "express": "^5.2.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "sichere-express-actions": "^2.4.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "vite": "^8.2.2"
+  }
+}

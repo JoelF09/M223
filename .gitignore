@@ -427,3 +427,9 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Generated project files
+docs/
+data.db
+data.db-shm
+data.db-wal
