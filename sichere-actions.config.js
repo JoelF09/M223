@@ -117,6 +117,22 @@ export default defineApp({
         modell: { type: 'string', required: true, min: 1 },
         kennzeichen: { type: 'string', required: true, unique: true },
       },
+      // "status" sagt nur, ob das Auto defekt ist oder nicht - ob es gerade
+      // vermietet ist, steht ausschliesslich in der vermietung-Tabelle (offene
+      // Vermietung vorhanden?). Ohne dieses Feld zeigte die Autos-Liste ein
+      // vermietetes Auto weiterhin als "verfuegbar" an. Rein berechnet, damit
+      // nirgends ein zweiter, redundanter Zustand gepflegt werden muss, der
+      // aus dem Takt geraten koennte.
+      computed: {
+        vermietet: {
+          field: { type: 'boolean', label: 'Vermietet' },
+          query: {
+            resource: 'vermietung',
+            where: ({ record }) => ({ autoId: record.id, zurueckgegebenAm: null }),
+          },
+          aggregate: 'exists',
+        },
+      },
     },
 
     vermietung: {
