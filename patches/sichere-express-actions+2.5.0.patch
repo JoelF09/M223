@@ -1,0 +1,48 @@
+diff --git a/node_modules/sichere-express-actions/packages/react/src/components.js b/node_modules/sichere-express-actions/packages/react/src/components.js
+index fe4ea90..423764d 100644
+--- a/node_modules/sichere-express-actions/packages/react/src/components.js
++++ b/node_modules/sichere-express-actions/packages/react/src/components.js
+@@ -166,14 +166,21 @@ export function ResourceTable({ resource, records = [], onEdit, onDelete, onTran
+           && Date.parse(record[metadata.reservation.atField]) + metadata.reservation.ttlMs > Date.now()
+           && h('span', { className: 'sichere-reservation', title: record[metadata.reservation.atField] },
+             `Vorgemerkt von ${leaseActorName(metadata, metadata.reservation, record, referenceOptions)} seit ${record[metadata.reservation.atField]} `),
+-        onEdit && (!canRecord || canRecord('update', record)) && h(EditButton, {
+-          onClick: () => onEdit(record),
+-          disabled: metadata.editingLock && record[metadata.editingLock.actorField] != null
++        onEdit && (!canRecord || canRecord('update', record)) && (() => {
++          // PATCH (siehe patches/): title stand bisher fest auf jedem
++          // Bearbeiten-Button, auch wenn disabled korrekt false war (sogar
++          // bei Resources ganz ohne editingLock) - jetzt nur noch, wenn
++          // tatsaechlich eine fremde aktive Sperre besteht.
++          const gesperrtDurchAndere = Boolean(metadata.editingLock && record[metadata.editingLock.actorField] != null
+             && Date.parse(record[metadata.editingLock.atField]) + metadata.editingLock.ttlMs > Date.now()
+             && String(record[metadata.editingLock.actorField]) !== String(user?.id)
+-            && !metadata.editingLock.overrideRoles.some((role) => userRoles(user).has(role)),
+-          title: 'Eine fremde aktive Sperre verhindert die Bearbeitung',
+-        }),
++            && !metadata.editingLock.overrideRoles.some((role) => userRoles(user).has(role)));
++          return h(EditButton, {
++            onClick: () => onEdit(record),
++            disabled: gesperrtDurchAndere,
++            title: gesperrtDurchAndere ? 'Eine fremde aktive Sperre verhindert die Bearbeitung' : undefined,
++          });
++        })(),
+         onDelete && (!canRecord || canRecord('delete', record)) && h(DeleteButton, { onClick: () => onDelete(record) }),
+         onHistory && h('button', { type: 'button', 'data-operation': 'history', onClick: () => onHistory(record) }, 'Historie'),
+         ...(onTransition ? Object.entries(workflowTransitions)
+diff --git a/node_modules/sichere-express-actions/packages/sqlite/src/repository.js b/node_modules/sichere-express-actions/packages/sqlite/src/repository.js
+index d88cc31..e5b6384 100644
+--- a/node_modules/sichere-express-actions/packages/sqlite/src/repository.js
++++ b/node_modules/sichere-express-actions/packages/sqlite/src/repository.js
+@@ -125,6 +125,11 @@ export function createResourceRepository({ db, resource }) {
+           const current = this.findById(id);
+           if (!current) throw new NotFoundError();
+           throw new ConflictError('Ressource wurde zwischenzeitlich geaendert', {
++            // PATCH (siehe patches/): stabiler Code fuer die Frontend-Logik -
++            // unabhaengig vom (uebersetzbaren) message-Text soll die UI einen
++            // echten Versionskonflikt von anderen 409-Ursachen (z.B. "Auto
++            // bereits vermietet") unterscheiden koennen.
++            code: optimistic ? 'VERSIONSKONFLIKT' : undefined,
+             current, submitted: input, currentData: current, submittedData: input,
+             currentVersion: optimistic ? current[versionField] : undefined,
+             changedAt: resource.tracking ? current[resource.tracking.updatedAt] : undefined,
