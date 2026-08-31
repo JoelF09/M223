@@ -25,6 +25,81 @@ import { SQLiteAuditAdapter, sqlite } from 'sichere-express-actions/sqlite';
 const dbDatei = fileURLToPath(new URL('./data.db', import.meta.url));
 const database = sqlite(dbDatei, { driver: new Driver(dbDatei) });
 
+// Auftrag "Rollen, Rechte und Freigaben": zentrale Rechte-Matrix als
+// Datentabelle statt als if-Kette. Bewusst direkt in dieser Datei statt in
+// einem eigenen backend/src/rechte.js - "es gibt keine weitere Quelle fuer
+// das Modell" (siehe Kommentar oben).
+//
+// "gruppe" ist die Spalte in der Tabelle account (siehe auth: { role: 'gruppe' }
+// weiter unten). Im ausgelesenen, angemeldeten Benutzerobjekt heisst dasselbe
+// Feld "role" (vom Framework so benannt) - deshalb prueft darf() unten
+// benutzer.role, nicht benutzer.gruppe.
+//
+// status: null bedeutet "Status spielt fuer dieses Recht keine Rolle" (z. B.
+// Ansehen). Eine fehlende Regel (kein Eintrag fuer aktion+role) bedeutet
+// immer "nicht erlaubt" - das ist bewusst so, nicht ein vergessener Fall.
+const REGELN = {
+  ansehen: {
+    mitarbeiter: { status: null, nurEigene: false },
+    admin: { status: null, nurEigene: false },
+  },
+  erfassen: {
+    mitarbeiter: { status: null, nurEigene: false },
+    admin: { status: null, nurEigene: false },
+  },
+  aendern: {
+    // Vermietung.kundeId aendern: nur solange offen, Mitarbeitende nur bei
+    // der eigenen (createdBy) Vermietung, Admin bei allen.
+    mitarbeiter: { status: ['offen'], nurEigene: true },
+    admin: { status: ['offen'], nurEigene: false },
+  },
+  zuruecknehmen: {
+    // Workflow-Transition "rueckgabe": beide Rollen, aber nur solange offen
+    // (die Zustandspruefung selbst macht die Workflow-Maschine - ein
+    // Ruecknahmeversuch im falschen Zustand bleibt bewusst ein 409
+    // "Konflikt", nicht ein 403 "keine Berechtigung": das ist kein
+    // Rechteproblem, sondern ein Zustandsproblem).
+    mitarbeiter: { status: null, nurEigene: false },
+    admin: { status: null, nurEigene: false },
+  },
+  stornieren: {
+    // Nur Admin, und nur solange die Vermietung noch offen ist - ein
+    // bereits abgeschlossener/stornierter/Unfall-Vorgang laesst sich auch
+    // von der Administration nicht mehr stornieren.
+    admin: { status: ['offen'], nurEigene: false },
+  },
+  kontenVerwalten: {
+    admin: { status: null, nurEigene: false },
+  },
+};
+
+function darf(benutzer, aktion, datensatz) {
+  const regel = REGELN[aktion]?.[benutzer?.role];
+  if (!regel) return false;
+  if (regel.status && !regel.status.includes(datensatz?.status)) return false;
+  if (regel.nurEigene && String(datensatz?.createdBy) !== String(benutzer?.id)) return false;
+  return true;
+}
+
+// Wandelt einen Eintrag aus REGELN in policy.rules-Eintraege um (ein
+// Allow-Eintrag pro Rolle, die dort eine Regel hat). Damit ist REGELN die
+// einzige Quelle der Wahrheit: dieselbe Tabelle erzeugt sowohl die
+// tatsaechlich ausgefuehrte Backend-Pruefung (policy weiter unten) als auch -
+// weil roles/states/ownerField deklarativ und nicht als Funktion vorliegen -
+// die Sichtbarkeit der Knoepfe im generierten Frontend (Teil C), ohne
+// zweite, separat gepflegte Kopie der Regeln.
+function policyRulesFor(aktion, actionName) {
+  return Object.entries(REGELN[aktion] ?? {})
+    .filter(([, regel]) => regel)
+    .map(([rolle, regel]) => ({
+      action: actionName,
+      effect: 'allow',
+      roles: [rolle],
+      ...(regel.status ? { states: regel.status } : {}),
+      ...(regel.nurEigene ? { ownerField: 'createdBy' } : {}),
+    }));
+}
+
 export default defineApp({
   name: 'Autovermietung Flughafen',
   database,
@@ -63,9 +138,17 @@ export default defineApp({
     // auf den Resourcennamen als Pfad zurueck. Ein eigener path wuerde davon
     // abweichen und zu einem 404 fuehren.
     account: {
-      operations: { list: true, get: true, create: false, update: false, delete: false },
+      // Auftrag "Rollen, Rechte und Freigaben": "Konten verwalten" ist eine
+      // reine Rollenfrage, keine Frage von Zustand oder Besitz - genau der
+      // Fall, den die Theorie der Guard-Middleware nurGruppe('admin')
+      // zuordnet. permissions.update ist hier das Framework-Aequivalent:
+      // ein grober Filter, der laeuft, bevor irgendein Datensatz geladen
+      // wurde. read bleibt fuer beide Rollen offen, weil die Namen (z. B.
+      // "Gesperrt von", "Erfasst von") sonst fuer Mitarbeitende nicht mehr
+      // aufgeloest werden koennten.
+      operations: { list: true, get: true, create: false, update: true, delete: false },
       documentation: { hidden: true },
-      permissions: { read: ['mitarbeiter', 'admin'] },
+      permissions: { read: ['mitarbeiter', 'admin'], update: ['admin'] },
       // Auftrag "Konflikterkennung": ohne eigenes display faellt die
       // Namensaufloesung fuer "geaendertVon"/"gesperrt von" (actorDetails())
       // auf die ID zurueck ([idField]-Default) statt auf den echten Namen.
@@ -160,6 +243,34 @@ export default defineApp({
       // generierte PUT-Route einzig kundeId (siehe readonly-Felder unten).
       operations: { list: true, get: true, create: false, update: true, delete: false },
       permissions: { update: ['mitarbeiter', 'admin'] },
+      // Auftrag "Rollen, Rechte und Freigaben", Teil B: ruft darf() direkt
+      // fuer die generierte PUT-Route (== die Service-Funktion aendern()
+      // aus dem Auftrag) auf. resource.authorize laeuft fuer jede Operation
+      // (read/update/...), deshalb hier bewusst auf "update" eingeschraenkt -
+      // fuer read greift stattdessen die policy weiter unten (siehe dort).
+      // Das ist keine Parallel-Pruefung zur policy: policy.rules steuert
+      // (deklarativ, ohne Funktionsaufruf) die Sichtbarkeit der Knoepfe im
+      // Frontend, dieser Aufruf hier ist die tatsaechlich massgebliche
+      // Backend-Pruefung mit derselben REGELN-Tabelle von oben.
+      authorize: async ({ operation, user, resource }) => (
+        operation !== 'update' || darf(user, 'aendern', resource)
+      ),
+      // policy.default: 'deny' setzt die Resource auf "alles verboten,
+      // ausser es steht ausdruecklich hier" (Prinzip aus der Theorie) - jede
+      // Operation/Transition unten braucht deshalb eine eigene Allow-Regel,
+      // sonst wuerde z. B. auch das Ansehen oder Zurueckgeben blockiert.
+      // ...policyRulesFor(...) erzeugt die aendern-Regeln direkt aus
+      // REGELN oben - dieselbe Tabelle wie beim darf()-Aufruf, nicht
+      // separat gepflegt.
+      policy: {
+        default: 'deny',
+        rules: [
+          { action: 'read', effect: 'allow', roles: ['mitarbeiter', 'admin'] },
+          ...policyRulesFor('aendern', 'update'),
+          { action: 'transition:rueckgabe', effect: 'allow', roles: ['mitarbeiter', 'admin'] },
+          { action: 'transition:stornieren', effect: 'allow', roles: ['admin'] },
+        ],
+      },
       audit: true,
       live: true,
       // Auftrag 7, Teil A: optimistisches Sperren. "version" wird von der
@@ -220,6 +331,23 @@ export default defineApp({
             // erlaubt"), obwohl fachlich nichts falsch gelaufen ist.
             idempotent: true,
           },
+          // Auftrag "Rollen, Rechte und Freigaben", Teil B: neue Route
+          // POST /api/vermietungen/:id/stornieren. roles:['admin'] ist der
+          // grobe Rollenfilter (entspricht nurGruppe('admin') und steuert
+          // zugleich, ob der Knopf im Frontend ueberhaupt erscheint -
+          // Teil C). from:'offen' ist die Zustandsmaschine selbst: ein
+          // Stornoversuch im falschen Zustand bleibt 409 (Konflikt), nicht
+          // 403 (keine Berechtigung) - das ist kein Rechteproblem.
+          // authorize ruft zusaetzlich woertlich darf() auf (Teil B
+          // verlangt genau das) - dort wird auch der Zustand nochmals
+          // geprueft, als zweite, unabhaengige Pruefstelle.
+          stornieren: {
+            from: 'offen',
+            to: 'storniert',
+            roles: ['admin'],
+            label: 'Stornieren',
+            authorize: async ({ user, resource }) => darf(user, 'stornieren', resource),
+          },
         },
       },
       // "unfall" erreicht dieses Feld nicht ueber eine Transition, sondern
@@ -238,7 +366,7 @@ export default defineApp({
           type: 'datetime', optional: true, nullable: true, readonly: true,
         },
         status: {
-          enum: ['offen', 'abgeschlossen', 'unfall'], default: 'offen', readonly: true, filterable: true,
+          enum: ['offen', 'abgeschlossen', 'unfall', 'storniert'], default: 'offen', readonly: true, filterable: true,
         },
       },
       // Ersetzt den fruehen manuellen SQL-Index in domain/vermietung.js: ein
