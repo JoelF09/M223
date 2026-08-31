@@ -26,6 +26,7 @@
   },
   "devDependencies": {
     "patch-package": "^8.0.1",
+    "playwright": "^1.62.1",
     "vite": "^8.2.2"
   }
 }
