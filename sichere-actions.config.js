@@ -61,6 +61,15 @@ export default defineApp({
       operations: { list: true, get: true, create: false, update: false, delete: false },
       documentation: { hidden: true },
       permissions: { read: ['mitarbeiter', 'admin'] },
+      // Auftrag "Konflikterkennung": ohne eigenes display faellt die
+      // Namensaufloesung fuer "geaendertVon"/"gesperrt von" (actorDetails())
+      // auf die ID zurueck ([idField]-Default) statt auf den echten Namen.
+      // Bewusst als Platzhalter-Vorlage "{name}", nicht als blosser
+      // Feldname "name": das Frontend (displayValue() in components.js)
+      // interpretiert einen String-display IMMER als Vorlage mit {feld} -
+      // ein Feldname ohne Klammern kommt unveraendert als Literaltext
+      // zurueck ("name" statt "Hans Meier").
+      display: '{name}',
       fields: {
         benutzername: { type: 'string', required: true, unique: true, min: 3 },
         passwort: { type: 'string', required: true, sensitive: true, min: 4 },
@@ -169,7 +178,11 @@ export default defineApp({
         actorField: 'gesperrtVon',
         atField: 'gesperrtAm',
         actorResource: 'account',
-        actorDisplay: 'name',
+        // "{name}" als Vorlage, nicht blosser Feldname "name": das Frontend
+        // (displayValue() in components.js) interpretiert einen String
+        // immer als {feld}-Vorlage - ohne Klammern kommt der Text
+        // unveraendert zurueck ("name" statt "Hans Meier").
+        actorDisplay: '{name}',
         roles: ['mitarbeiter', 'admin'],
         ttl: '10m',
         acquirePath: '/sperren',
@@ -195,6 +208,12 @@ export default defineApp({
             roles: ['mitarbeiter', 'admin'],
             label: 'Zurückgeben',
             values: () => ({ zurueckgegebenAm: now() }),
+            // Auftrag "Konflikterkennung", Teil E: zweimal dieselbe
+            // Vermietung stornieren fuehrt zum selben Ergebnis wie einmal -
+            // ohne idempotent:true meldet die zweite Anfrage faelschlich
+            // einen 409 ("Wechsel von abgeschlossen nach abgeschlossen nicht
+            // erlaubt"), obwohl fachlich nichts falsch gelaufen ist.
+            idempotent: true,
           },
         },
       },
