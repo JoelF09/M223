@@ -1,3 +1,21 @@
+diff --git a/node_modules/sichere-express-actions/packages/application/src/resourceService.js b/node_modules/sichere-express-actions/packages/application/src/resourceService.js
+index 3cdcd3e..4e65bd2 100644
+--- a/node_modules/sichere-express-actions/packages/application/src/resourceService.js
++++ b/node_modules/sichere-express-actions/packages/application/src/resourceService.js
+@@ -331,7 +331,12 @@ export class ResourceService {
+         : { [config.actorField]: current[config.actorField] };
+       return serializeResource(this.resource, await this.repository.updateWhere(id, changes, expected, { concurrency: false }));
+     };
+-    return this.database?.transaction ? this.database.transaction(operation) : operation();
++    const result = this.database?.transaction ? await this.database.transaction(operation) : await operation();
++    // PATCH (siehe patches/): Sperren/Entsperren loeste bisher kein Live-Update
++    // aus - andere bereits offene Fenster sahen den Sperrstatus erst nach
++    // manuellem Neuladen, nicht sofort ueber SSE.
++    await this.publish(`${kind}:${acquire ? 'acquire' : 'release'}`, result);
++    return result;
+   }
+ 
+   acquireLock(id, context) { return this.changeLease('locked', id, true, context); }
 diff --git a/node_modules/sichere-express-actions/packages/react/src/components.js b/node_modules/sichere-express-actions/packages/react/src/components.js
 index fe4ea90..e748972 100644
 --- a/node_modules/sichere-express-actions/packages/react/src/components.js
