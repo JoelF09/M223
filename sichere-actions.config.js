@@ -35,6 +35,11 @@ export default defineApp({
   documentation: {
     title: 'Autovermietung Flughafen',
     directory: fileURLToPath(new URL('./docs/generated', import.meta.url)),
+    description: 'Fachanwendung fuer die Autovermietung am Flughafen: Kunden, '
+      + 'Fahrzeuge und Vermietungen verwalten, inklusive Konfliktbehandlung '
+      + '(Transaktionen, optimistisches/pessimistisches Sperren) fuer mehrere '
+      + 'gleichzeitige Benutzer am Schalter.',
+    author: 'Joel Felix',
   },
 
   // Der Header, ueber den sich Hans, Paul und die Administration ausweisen
