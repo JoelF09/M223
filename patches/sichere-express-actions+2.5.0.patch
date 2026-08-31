@@ -1,14 +1,23 @@
 diff --git a/node_modules/sichere-express-actions/packages/react/src/components.js b/node_modules/sichere-express-actions/packages/react/src/components.js
-index fe4ea90..423764d 100644
+index fe4ea90..e748972 100644
 --- a/node_modules/sichere-express-actions/packages/react/src/components.js
 +++ b/node_modules/sichere-express-actions/packages/react/src/components.js
-@@ -166,14 +166,21 @@ export function ResourceTable({ resource, records = [], onEdit, onDelete, onTran
+@@ -161,19 +161,28 @@ export function ResourceTable({ resource, records = [], onEdit, onDelete, onTran
+         metadata.editingLock && record[metadata.editingLock.actorField] != null
+           && Date.parse(record[metadata.editingLock.atField]) + metadata.editingLock.ttlMs > Date.now()
+           && h('span', { className: 'sichere-lock', title: record[metadata.editingLock.atField] },
+-            `Gesperrt von ${leaseActorName(metadata, metadata.editingLock, record, referenceOptions)} seit ${record[metadata.editingLock.atField]} `),
++            // PATCH (siehe patches/): Zeitpunkt roh als ISO-String angezeigt
++            // ("seit 2026-08-31T08:35:31.667Z") statt normal formatiert.
++            `Gesperrt von ${leaseActorName(metadata, metadata.editingLock, record, referenceOptions)} seit ${historyDate(record[metadata.editingLock.atField])} `),
+         metadata.reservation && record[metadata.reservation.actorField] != null
            && Date.parse(record[metadata.reservation.atField]) + metadata.reservation.ttlMs > Date.now()
            && h('span', { className: 'sichere-reservation', title: record[metadata.reservation.atField] },
-             `Vorgemerkt von ${leaseActorName(metadata, metadata.reservation, record, referenceOptions)} seit ${record[metadata.reservation.atField]} `),
+-            `Vorgemerkt von ${leaseActorName(metadata, metadata.reservation, record, referenceOptions)} seit ${record[metadata.reservation.atField]} `),
 -        onEdit && (!canRecord || canRecord('update', record)) && h(EditButton, {
 -          onClick: () => onEdit(record),
 -          disabled: metadata.editingLock && record[metadata.editingLock.actorField] != null
++            `Vorgemerkt von ${leaseActorName(metadata, metadata.reservation, record, referenceOptions)} seit ${historyDate(record[metadata.reservation.atField])} `),
 +        onEdit && (!canRecord || canRecord('update', record)) && (() => {
 +          // PATCH (siehe patches/): title stand bisher fest auf jedem
 +          // Bearbeiten-Button, auch wenn disabled korrekt false war (sogar
@@ -30,6 +39,17 @@ index fe4ea90..423764d 100644
          onDelete && (!canRecord || canRecord('delete', record)) && h(DeleteButton, { onClick: () => onDelete(record) }),
          onHistory && h('button', { type: 'button', 'data-operation': 'history', onClick: () => onHistory(record) }, 'Historie'),
          ...(onTransition ? Object.entries(workflowTransitions)
+@@ -248,7 +257,9 @@ export function ConflictDialog({ conflict, onReload, onForce, onCancel }) {
+   return h('div', { role: 'alertdialog', 'aria-modal': true, 'data-view': 'conflict' },
+     h('p', null, 'Dieser Datensatz wurde zwischenzeitlich geaendert.'),
+     conflict.changedBy != null && h('p', null, `Geaendert von: ${conflict.changedByName ?? conflict.changedByActor?.name ?? conflict.changedBy}`),
+-    conflict.changedAt && h('p', null, `Geaendert am: ${conflict.changedAt}`),
++    // PATCH (siehe patches/): Zeitpunkt roh als ISO-String angezeigt statt
++    // normal formatiert (dieselbe historyDate()-Funktion wie sonst im Framework).
++    conflict.changedAt && h('p', null, `Geaendert am: ${historyDate(conflict.changedAt)}`),
+     names.length > 0 && h('table', null,
+       h('thead', null, h('tr', null, h('th', null, 'Feld'), h('th', null, 'Aktuell'), h('th', null, 'Meine Eingabe'))),
+       h('tbody', null, ...names.map((name) => h('tr', { key: name },
 diff --git a/node_modules/sichere-express-actions/packages/sqlite/src/repository.js b/node_modules/sichere-express-actions/packages/sqlite/src/repository.js
 index d88cc31..e5b6384 100644
 --- a/node_modules/sichere-express-actions/packages/sqlite/src/repository.js
