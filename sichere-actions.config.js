@@ -1,549 +1,849 @@
-// Die gesamte fachliche Anwendung. Datenbank, REST-API, Rechte, Validierung,
-// Konfliktschutz, Nachvollziehbarkeit und das React-Frontend werden daraus
-// abgeleitet - es gibt keine weitere Quelle fuer das Modell.
-//
-// Frueher war dasselbe Fachmodell auf backend/ (fuenf Schichten,
-// handgeschriebener Server, eigene React-Komponenten) und frontend/ verteilt.
-// Diese Datei ersetzt das vollstaendig; die alte Version liegt unveraendert
-// in _manuelle-vorversion/ (siehe README dort).
-//
-// Start: npm install, dann npm run dev - http://localhost:5173
-
-import Driver from 'better-sqlite3';
 import { fileURLToPath } from 'node:url';
 import {
+  ConflictError,
+  ForbiddenError,
+  HttpError,
+  MemoryEventBus,
+  NotFoundError,
   conflict,
-  custom,
   defineApp,
-  now,
+  notExists,
   param,
 } from 'sichere-express-actions';
-import { SQLiteAuditAdapter, sqlite } from 'sichere-express-actions/sqlite';
+import { sqlite } from 'sichere-express-actions/sqlite';
+import { fachlicheRegressionen } from './tests/fachliche-regressionen.js';
 
-// better-sqlite3 statt des eingebauten node:sqlite: Letzteres ist in Node 22
-// noch experimentell und meldet das bei jedem Start.
-const dbDatei = fileURLToPath(new URL('./data.db', import.meta.url));
-const database = sqlite(dbDatei, { driver: new Driver(dbDatei) });
+const PRODUKTIONS_DATENBANK = fileURLToPath(new URL('./vermietung.db', import.meta.url));
 
-// Auftrag "Rollen, Rechte und Freigaben": zentrale Rechte-Matrix als
-// Datentabelle statt als if-Kette. Bewusst direkt in dieser Datei statt in
-// einem eigenen backend/src/rechte.js - "es gibt keine weitere Quelle fuer
-// das Modell" (siehe Kommentar oben).
-//
-// "gruppe" ist die Spalte in der Tabelle account (siehe auth: { role: 'gruppe' }
-// weiter unten). Im ausgelesenen, angemeldeten Benutzerobjekt heisst dasselbe
-// Feld "role" (vom Framework so benannt) - deshalb prueft darf() unten
-// benutzer.role, nicht benutzer.gruppe.
-//
-// status: null bedeutet "Status spielt fuer dieses Recht keine Rolle" (z. B.
-// Ansehen). Eine fehlende Regel (kein Eintrag fuer aktion+role) bedeutet
-// immer "nicht erlaubt" - das ist bewusst so, nicht ein vergessener Fall.
-const REGELN = {
-  ansehen: {
-    mitarbeiter: { status: null, nurEigene: false },
-    admin: { status: null, nurEigene: false },
-  },
-  erfassen: {
-    mitarbeiter: { status: null, nurEigene: false },
-    admin: { status: null, nurEigene: false },
-  },
-  aendern: {
-    // Vermietung.kundeId aendern: nur solange offen, Mitarbeitende nur bei
-    // der eigenen (createdBy) Vermietung, Admin bei allen.
-    mitarbeiter: { status: ['offen'], nurEigene: true },
-    admin: { status: ['offen'], nurEigene: false },
-  },
-  zuruecknehmen: {
-    // Workflow-Transition "rueckgabe": beide Rollen, aber nur solange offen
-    // (die Zustandspruefung selbst macht die Workflow-Maschine - ein
-    // Ruecknahmeversuch im falschen Zustand bleibt bewusst ein 409
-    // "Konflikt", nicht ein 403 "keine Berechtigung": das ist kein
-    // Rechteproblem, sondern ein Zustandsproblem).
-    mitarbeiter: { status: null, nurEigene: false },
-    admin: { status: null, nurEigene: false },
-  },
-  stornieren: {
-    // Nur Admin, und nur solange die Vermietung noch offen ist - ein
-    // bereits abgeschlossener/stornierter/Unfall-Vorgang laesst sich auch
-    // von der Administration nicht mehr stornieren.
-    admin: { status: ['offen'], nurEigene: false },
-  },
-  kontenVerwalten: {
-    admin: { status: null, nurEigene: false },
-  },
-};
-
-function darf(benutzer, aktion, datensatz) {
-  const regel = REGELN[aktion]?.[benutzer?.role];
-  if (!regel) return false;
-  if (regel.status && !regel.status.includes(datensatz?.status)) return false;
-  if (regel.nurEigene && String(datensatz?.createdBy) !== String(benutzer?.id)) return false;
-  return true;
-}
-
-// Wandelt einen Eintrag aus REGELN in policy.rules-Eintraege um (ein
-// Allow-Eintrag pro Rolle, die dort eine Regel hat). Damit ist REGELN die
-// einzige Quelle der Wahrheit: dieselbe Tabelle erzeugt sowohl die
-// tatsaechlich ausgefuehrte Backend-Pruefung (policy weiter unten) als auch -
-// weil roles/states/ownerField deklarativ und nicht als Funktion vorliegen -
-// die Sichtbarkeit der Knoepfe im generierten Frontend (Teil C), ohne
-// zweite, separat gepflegte Kopie der Regeln.
-function policyRulesFor(aktion, actionName) {
-  return Object.entries(REGELN[aktion] ?? {})
-    .filter(([, regel]) => regel)
-    .map(([rolle, regel]) => ({
-      action: actionName,
-      effect: 'allow',
-      roles: [rolle],
-      ...(regel.status ? { states: regel.status } : {}),
-      ...(regel.nurEigene ? { ownerField: 'createdBy' } : {}),
-    }));
-}
-
-export default defineApp({
-  name: 'Autovermietung Flughafen',
-  database,
-  audit: new SQLiteAuditAdapter(database),
-  api: { prefix: '/api' },
-  ui: { generated: true, title: 'Autovermietung Flughafen', port: 5173 },
-  migrations: { directory: fileURLToPath(new URL('./migrations', import.meta.url)) },
-  documentation: {
-    title: 'Autovermietung Flughafen',
-    directory: fileURLToPath(new URL('./docs/generated', import.meta.url)),
-    description: 'Fachanwendung fuer die Autovermietung am Flughafen: Kunden, '
-      + 'Fahrzeuge und Vermietungen verwalten, inklusive Konfliktbehandlung '
-      + '(Transaktionen, optimistisches/pessimistisches Sperren) fuer mehrere '
-      + 'gleichzeitige Benutzer am Schalter.',
-    author: 'Joel Felix',
-  },
-
-  // Der Header, ueber den sich Hans, Paul und die Administration ausweisen
-  // (x-account-id, Standardwert), kommt vom generierten Login-Formular selbst
-  // - keine eigene Anmeldeseite noetig.
-  auth: {
-    resource: 'account',
-    username: 'benutzername',
-    password: 'passwort',
-    role: 'gruppe',
-  },
-
-  resources: {
-    // Konten legt niemand ueber die API an - das macht ausschliesslich der
-    // Seed. documentation.hidden blendet die eigene Navigation aus; lesbar
-    // bleibt die Resource trotzdem, damit "Erfasst von" in der
-    // Vermietungsliste einen Namen statt nur eine ID zeigt.
-    // Kein eigener "path" hier: documentation.hidden nimmt account aus der
-    // Liste, die das generierte Frontend zur Pfadauflösung von
-    // Referenzfeldern (z. B. vermietung.createdBy) benutzt - danach faellt es
-    // auf den Resourcennamen als Pfad zurueck. Ein eigener path wuerde davon
-    // abweichen und zu einem 404 fuehren.
-    account: {
-      // Auftrag "Rollen, Rechte und Freigaben": "Konten verwalten" ist eine
-      // reine Rollenfrage, keine Frage von Zustand oder Besitz - genau der
-      // Fall, den die Theorie der Guard-Middleware nurGruppe('admin')
-      // zuordnet. permissions.update ist hier das Framework-Aequivalent:
-      // ein grober Filter, der laeuft, bevor irgendein Datensatz geladen
-      // wurde. read bleibt fuer beide Rollen offen, weil die Namen (z. B.
-      // "Gesperrt von", "Erfasst von") sonst fuer Mitarbeitende nicht mehr
-      // aufgeloest werden koennten.
-      operations: { list: true, get: true, create: false, update: true, delete: false },
-      documentation: { hidden: true },
-      permissions: { read: ['mitarbeiter', 'admin'], update: ['admin'] },
-      // Auftrag "Konflikterkennung": ohne eigenes display faellt die
-      // Namensaufloesung fuer "geaendertVon"/"gesperrt von" (actorDetails())
-      // auf die ID zurueck ([idField]-Default) statt auf den echten Namen.
-      // Bewusst als Platzhalter-Vorlage "{name}", nicht als blosser
-      // Feldname "name": das Frontend (displayValue() in components.js)
-      // interpretiert einen String-display IMMER als Vorlage mit {feld} -
-      // ein Feldname ohne Klammern kommt unveraendert als Literaltext
-      // zurueck ("name" statt "Hans Meier").
-      display: '{name}',
-      fields: {
-        benutzername: { type: 'string', required: true, unique: true, min: 3 },
-        passwort: { type: 'string', required: true, sensitive: true, min: 4 },
-        name: 'string!',
-        station: 'string',
-        gruppe: ['mitarbeiter', 'admin'],
-      },
-    },
-
-    kunde: {
-      label: 'Kunde',
-      pluralLabel: 'Kunden',
-      path: '/kunden',
-      display: ['vorname', 'nachname'],
-      defaultSort: 'nachname',
-      audit: true,
-      live: true,
-      optimisticLock: true,
-      permissions: {
-        create: ['mitarbeiter', 'admin'],
-        update: ['mitarbeiter', 'admin'],
-        delete: ['admin'],
-      },
-      fields: {
-        vorname: { type: 'string', required: true, min: 2 },
-        nachname: { type: 'string', required: true, min: 2 },
-      },
-    },
-
-    auto: {
-      label: 'Auto',
-      pluralLabel: 'Autos',
-      path: '/autos',
-      display: '{marke} {modell} ({kennzeichen})',
-      defaultSort: 'kennzeichen',
-      audit: true,
-      live: true,
-      permissions: { create: ['admin'], update: ['admin'], delete: ['admin'] },
-      // Ersetzt das fruehere Statusfeld mit Default+readonly von Hand: Der
-      // Workflow legt "status" selbst als Enum an, setzt "verfuegbar" als
-      // Startwert und generiert aus der Transition eine eigene Route samt
-      // Knopf im Frontend - erscheint automatisch, sobald ein Auto "defekt"
-      // ist und die angemeldete Person Admin ist.
-      workflow: {
-        initial: 'verfuegbar',
-        transitions: {
-          freigeben: {
-            from: 'defekt', to: 'verfuegbar', roles: ['admin'], label: 'Wieder freigeben',
-          },
-        },
-      },
-      fields: {
-        marke: { type: 'string', required: true, min: 2 },
-        modell: { type: 'string', required: true, min: 1 },
-        kennzeichen: { type: 'string', required: true, unique: true },
-      },
-      // "status" sagt nur, ob das Auto defekt ist oder nicht - ob es gerade
-      // vermietet ist, steht ausschliesslich in der vermietung-Tabelle (offene
-      // Vermietung vorhanden?). Ohne dieses Feld zeigte die Autos-Liste ein
-      // vermietetes Auto weiterhin als "verfuegbar" an. Rein berechnet, damit
-      // nirgends ein zweiter, redundanter Zustand gepflegt werden muss, der
-      // aus dem Takt geraten koennte.
-      computed: {
-        vermietet: {
-          field: { type: 'boolean', label: 'Vermietet' },
-          query: {
-            resource: 'vermietung',
-            where: ({ record }) => ({ autoId: record.id, zurueckgegebenAm: null }),
-          },
-          aggregate: 'exists',
-        },
-      },
-    },
-
-    vermietung: {
-      label: 'Vermietung',
-      pluralLabel: 'Vermietungen',
-      path: '/vermietungen',
-      // Angelegt wird ausschliesslich ueber die Action "vermieten" weiter
-      // unten - eine Vermietung ist ein Vorgang mit Vorbedingung (Auto muss
-      // frei sein), kein einfacher Datensatz. update:true ab hier nur fuer
-      // Auftrag 7 (PUT mit Versionspruefung) - schreibbar bleibt ueber die
-      // generierte PUT-Route einzig kundeId (siehe readonly-Felder unten).
-      operations: { list: true, get: true, create: false, update: true, delete: false },
-      permissions: { update: ['mitarbeiter', 'admin'] },
-      // Auftrag "Rollen, Rechte und Freigaben", Teil B: ruft darf() direkt
-      // fuer die generierte PUT-Route (== die Service-Funktion aendern()
-      // aus dem Auftrag) auf. resource.authorize laeuft fuer jede Operation
-      // (read/update/...), deshalb hier bewusst auf "update" eingeschraenkt -
-      // fuer read greift stattdessen die policy weiter unten (siehe dort).
-      // Das ist keine Parallel-Pruefung zur policy: policy.rules steuert
-      // (deklarativ, ohne Funktionsaufruf) die Sichtbarkeit der Knoepfe im
-      // Frontend, dieser Aufruf hier ist die tatsaechlich massgebliche
-      // Backend-Pruefung mit derselben REGELN-Tabelle von oben.
-      authorize: async ({ operation, user, resource }) => (
-        operation !== 'update' || darf(user, 'aendern', resource)
-      ),
-      // policy.default: 'deny' setzt die Resource auf "alles verboten,
-      // ausser es steht ausdruecklich hier" (Prinzip aus der Theorie) - jede
-      // Operation/Transition unten braucht deshalb eine eigene Allow-Regel,
-      // sonst wuerde z. B. auch das Ansehen oder Zurueckgeben blockiert.
-      // ...policyRulesFor(...) erzeugt die aendern-Regeln direkt aus
-      // REGELN oben - dieselbe Tabelle wie beim darf()-Aufruf, nicht
-      // separat gepflegt.
-      policy: {
-        default: 'deny',
-        rules: [
-          { action: 'read', effect: 'allow', roles: ['mitarbeiter', 'admin'] },
-          ...policyRulesFor('aendern', 'update'),
-          { action: 'transition:rueckgabe', effect: 'allow', roles: ['mitarbeiter', 'admin'] },
-          { action: 'transition:stornieren', effect: 'allow', roles: ['admin'] },
-        ],
-      },
-      audit: true,
-      live: true,
-      // Auftrag 7, Teil A: optimistisches Sperren. "version" wird von der
-      // Framework-Resource selbst ergaenzt (int, generated, default 1) und
-      // bei jedem Update via "WHERE id=? AND version=?" geprueft - genau das
-      // Muster aus Thema7-Sperrstrategien.md. Bei 0 betroffenen Zeilen
-      // unterscheidet die Resource-Service-Schicht selbst zwischen
-      // "Datensatz existiert nicht" (404) und "Version veraltet" (409 mit
-      // aktueller Version/Zeitpunkt/Daten) - das ist die Stelle aus dem
-      // Auftrag, an der es sonst am haeufigsten hakt.
-      optimisticLock: true,
-      // Auftrag 7, Teil C: pessimistisches Sperren. gesperrtVon/gesperrtAm
-      // werden als Spalten "gesperrt_von"/"gesperrt_am" ergaenzt (FK auf
-      // account). POST .../sperren und POST .../entsperren entstehen daraus
-      // automatisch; eine fremde, noch gueltige Sperre fuehrt beim Sperren
-      // *und* beim naechsten PUT zu 423 samt Name (actorDisplay: 'name') und
-      // Sperrzeitpunkt. ttl: '10m' ist die Ablaufzeit aus Schritt 12 - ohne
-      // sie bliebe eine Vermietung fuer immer blockiert, sobald jemand den
-      // Browser zuklappt. overrideRoles ist standardmaessig schon ['admin'].
-      editingLock: {
-        actorField: 'gesperrtVon',
-        atField: 'gesperrtAm',
-        actorResource: 'account',
-        // "{name}" als Vorlage, nicht blosser Feldname "name": das Frontend
-        // (displayValue() in components.js) interpretiert einen String
-        // immer als {feld}-Vorlage - ohne Klammern kommt der Text
-        // unveraendert zurueck ("name" statt "Hans Meier").
-        actorDisplay: '{name}',
-        roles: ['mitarbeiter', 'admin'],
-        ttl: '10m',
-        acquirePath: '/sperren',
-        releasePath: '/entsperren',
-        releaseMethod: 'post',
-      },
-      // Ersetzt die von Hand gepflegten Felder accountId/erstelltVon/
-      // geaendertAm: tracking traegt "wer hat angelegt/zuletzt geaendert"
-      // automatisch bei jedem Schreibzugriff nach - aus dem angemeldeten
-      // Benutzer, nicht aus dem Formular.
-      tracking: { actorResource: 'account' },
-      // "Zurueckgeben" ist eine Workflow-Transition statt einer eigenen
-      // Action: Sie erzeugt POST /api/vermietungen/:id/rueckgabe von selbst
-      // und im generierten Frontend erscheint der Knopf automatisch bei
-      // jeder Vermietung mit Status "offen".
-      workflow: {
-        field: 'status',
-        initial: 'offen',
-        transitions: {
-          rueckgabe: {
-            from: 'offen',
-            to: 'abgeschlossen',
-            roles: ['mitarbeiter', 'admin'],
-            label: 'Zurückgeben',
-            values: () => ({ zurueckgegebenAm: now() }),
-            // Auftrag "Konflikterkennung", Teil E: zweimal dieselbe
-            // Vermietung stornieren fuehrt zum selben Ergebnis wie einmal -
-            // ohne idempotent:true meldet die zweite Anfrage faelschlich
-            // einen 409 ("Wechsel von abgeschlossen nach abgeschlossen nicht
-            // erlaubt"), obwohl fachlich nichts falsch gelaufen ist.
-            idempotent: true,
-          },
-          // Auftrag "Rollen, Rechte und Freigaben", Teil B: neue Route
-          // POST /api/vermietungen/:id/stornieren. roles:['admin'] ist der
-          // grobe Rollenfilter (entspricht nurGruppe('admin') und steuert
-          // zugleich, ob der Knopf im Frontend ueberhaupt erscheint -
-          // Teil C). from:'offen' ist die Zustandsmaschine selbst: ein
-          // Stornoversuch im falschen Zustand bleibt 409 (Konflikt), nicht
-          // 403 (keine Berechtigung) - das ist kein Rechteproblem.
-          // authorize ruft zusaetzlich woertlich darf() auf (Teil B
-          // verlangt genau das) - dort wird auch der Zustand nochmals
-          // geprueft, als zweite, unabhaengige Pruefstelle.
-          stornieren: {
-            from: 'offen',
-            to: 'storniert',
-            roles: ['admin'],
-            label: 'Stornieren',
-            authorize: async ({ user, resource }) => darf(user, 'stornieren', resource),
-          },
-        },
-      },
-      // "unfall" erreicht dieses Feld nicht ueber eine Transition, sondern
-      // ueber die Action "unfallMelden" (schreibt zusammen mit auto.status in
-      // derselben Transaktion) - deshalb hier von Hand als Enum deklariert,
-      // ergaenzend zu den beiden Workflow-Zustaenden.
-      // autoId/zurueckgegebenAm sind readonly: die generierte PUT-Route darf
-      // nur kundeId (+ version) aendern - welches Auto und ob zurueckgegeben
-      // wurde, laeuft ausschliesslich ueber vermieten() bzw. die
-      // rueckgabe-Transition, nicht per freiem Update.
-      fields: {
-        autoId: { ref: 'auto', required: true, readonly: true },
-        kundeId: 'ref:kunde!',
-        ausgeliehenAm: { type: 'datetime', required: true, readonly: true },
-        zurueckgegebenAm: {
-          type: 'datetime', optional: true, nullable: true, readonly: true,
-        },
-        status: {
-          enum: ['offen', 'abgeschlossen', 'unfall', 'storniert'], default: 'offen', readonly: true, filterable: true,
-        },
-      },
-      // Ersetzt den fruehen manuellen SQL-Index in domain/vermietung.js: ein
-      // Auto darf hoechstens eine offene (zurueckgegebenAm IS NULL)
-      // Vermietung gleichzeitig haben.
-      indexes: [
-        {
-          name: 'auto_nur_einmal_offen', fields: ['autoId'], unique: true, where: { zurueckgegebenAm: null },
-        },
-      ],
-    },
-
-    // Auftrag 6, Teil A: eigenes Protokoll statt des eingebauten
-    // "_sichere_audit" - damit Tabelle und Spalten dem Auftragstext
-    // entsprechen. feld/alter_wert/neuer_wert kommen laut Auftrag erst
-    // spaeter dazu, deshalb noch nicht hier.
-    protokoll: {
-      label: 'Protokoll',
-      pluralLabel: 'Protokoll',
-      operations: {
-        list: true, get: true, create: false, update: false, delete: false,
-      },
-      documentation: { hidden: true },
-      permissions: { read: ['mitarbeiter', 'admin'] },
-      fields: {
-        tabelle: { type: 'string', required: true },
-        datensatzId: { type: 'string', required: true },
-        aktion: { type: 'string', required: true },
-        accountId: 'ref:account!',
-        zeitpunkt: { type: 'datetime', required: true },
-      },
-    },
-  },
-
-  // "login" entsteht automatisch aus dem auth-Block oben (POST /api/login) -
-  // keine eigene Action noetig.
-  actions: {
-    // Die Race Condition ("zwei Anfragen vermieten gleichzeitig dasselbe
-    // Auto") wird an drei Stellen gleichzeitig geschlossen:
-    //   lock: true auf autoId serialisiert Anfragen zum selben Auto,
-    //   transaction: true haelt Pruefung, INSERT und Protokolleintrag in
-    //     einer Transaktion (siehe Thema6-Transaktionen.md, Teil C),
-    //   die Pruefung in execute() ist die fachliche Regel selbst.
-    //
-    // Auftrag 6: die drei Schritte (pruefen, erstelleVermietung,
-    // schreibeProtokoll) stehen bewusst als eigene execute()-Funktion da,
-    // statt als require()/create()/audit()-Kurzform - so ist Teil A/B (die
-    // Schritte einzeln, noch ohne Transaktion) und Teil C (dieselben
-    // Schritte in db.transaction()) am Code sichtbar derselbe Ablauf, nur
-    // mit/ohne die Klammer "transaction: true" darum.
-    vermieten: () => ({
-      method: 'post',
-      path: '/vermietungen',
-      input: {
-        autoId: {
-          ref: 'auto', required: true, lock: true, label: 'Auto',
-        },
-        kundeId: { ref: 'kunde', required: true, label: 'Kunde' },
-      },
-      roles: ['mitarbeiter', 'admin'],
-      // TEIL C: alle drei Schritte unten laufen gemeinsam in
-      // db.transaction() - siehe Thema6-Transaktionen.md.
-      transaction: true,
-      execute: async ({ input, repositories, user }) => {
-        // Schritt 1: pruefen - bewusst *innerhalb* der Transaktion (siehe
-        // Tipp im Auftrag): ausserhalb wuerde zwischen Pruefung und Anlegen
-        // wieder ein Fenster fuer die Race Condition entstehen.
-        const auto = await repositories.auto.findById(input.autoId);
-        if (auto?.status !== 'verfuegbar') throw conflict('Dieses Auto ist derzeit nicht verfuegbar');
-        const offeneVermietung = await repositories.vermietung.findOne({
-          autoId: input.autoId, zurueckgegebenAm: null,
-        });
-        if (offeneVermietung) throw conflict('Dieses Auto ist bereits vermietet');
-
-        // Schritt 2: erstelleVermietung() - createdAt/createdBy von Hand
-        // gesetzt, weil execute() (anders als die require()/create()-Kurzform)
-        // das automatische tracking: { actorResource: 'account' } umgeht.
-        const vermietung = await repositories.vermietung.create({
-          autoId: input.autoId,
-          kundeId: input.kundeId,
-          status: 'offen',
-          ausgeliehenAm: now(),
-          zurueckgegebenAm: null,
-          createdAt: now(),
-          createdBy: user.id,
-        });
-
-        // Schritt 3: schreibeProtokoll()
-        await repositories.protokoll.create({
-          tabelle: 'vermietung',
-          datensatzId: String(vermietung.id),
-          aktion: 'vermieten',
-          accountId: user.id,
-          zeitpunkt: now(),
-        });
-
-        return vermietung;
-      },
-      publish: ({ result }) => ({
-        topic: 'vermietung.changed', data: { operation: 'create', resource: 'vermietung', value: result },
-      }),
-      successStatus: 201,
-    }),
-
-    // Zwei Schreibvorgaenge, die zusammengehoeren: die offene Vermietung
-    // dieses Autos (falls vorhanden) wird mit Status "unfall" geschlossen,
-    // und das Auto selbst wird "defekt". Deshalb eine eigene Action statt
-    // einer Workflow-Transition, die immer nur eine Resource aendert.
-    unfallMelden: () => ({
-      method: 'post',
-      path: '/autos/:id/unfall',
-      input: {
-        autoId: {
-          ref: 'auto', required: true, source: param('id'), lock: true, label: 'Auto',
-        },
-      },
-      roles: ['mitarbeiter', 'admin'],
-      transaction: true,
-      require: [
-        custom(
-          async ({ input, repositories }) => (
-            await repositories.auto.findById(input.autoId)
-          )?.status !== 'defekt',
-          { error: conflict('Auto ist bereits als defekt gemeldet') },
-        ),
-      ],
-      execute: async ({ input, repositories }) => {
-        const laufend = await repositories.vermietung.findOne({ autoId: input.autoId, zurueckgegebenAm: null });
-        const vermietung = laufend
-          ? await repositories.vermietung.update(laufend.id, { zurueckgegebenAm: now(), status: 'unfall' })
-          : null;
-        const auto = await repositories.auto.update(input.autoId, { status: 'defekt' });
-        return { id: auto.id, auto, vermietung };
-      },
-      publish: ({ result }) => ({
-        topic: 'auto.changed', data: { operation: 'update', resource: 'auto', value: result.auto },
-      }),
-    }),
-  },
-
-  seed: {
-    account: [
-      {
-        benutzername: 'hans', passwort: '1234', name: 'Hans Meier', station: 'Flughafen Schalter 1', gruppe: 'mitarbeiter',
-      },
-      {
-        benutzername: 'paul', passwort: '1234', name: 'Paul Weber', station: 'Flughafen Schalter 2', gruppe: 'mitarbeiter',
-      },
-      {
-        benutzername: 'admin', passwort: '1234', name: 'Admin Person', station: 'Zentrale', gruppe: 'admin',
-      },
-    ],
-    kunde: [
-      { vorname: 'Anna', nachname: 'Keller' },
-      { vorname: 'Bruno', nachname: 'Steiner' },
-      { vorname: 'Carla', nachname: 'Frei' },
-    ],
-    auto: [
-      { marke: 'VW', modell: 'Golf', kennzeichen: 'ZH 100 001' },
-      { marke: 'Skoda', modell: 'Octavia', kennzeichen: 'ZH 100 002' },
-      { marke: 'Fiat', modell: 'Panda', kennzeichen: 'ZH 100 003' },
-    ],
-    // Als Funktion, damit die IDs der oben angelegten Datensaetze nachgeschlagen
-    // werden koennen, statt sie als "1", "1" zu erraten.
-    vermietung: async ({ repositories }) => {
-      const golf = await repositories.auto.findOne({ kennzeichen: 'ZH 100 001' });
-      const anna = await repositories.kunde.findOne({ vorname: 'Anna', nachname: 'Keller' });
-      const hans = await repositories.account.findOne({ benutzername: 'hans' });
-      const jetzt = new Date().toISOString();
-      return [{
-        autoId: golf.id,
-        kundeId: anna.id,
-        createdBy: hans.id,
-        status: 'offen',
-        ausgeliehenAm: jetzt,
-        zurueckgegebenAm: null,
-      }];
-    },
-  },
+const STATUS = ['offen', 'reserviert', 'aktiv', 'abgeschlossen', 'storniert'];
+const ENDZUSTAENDE = new Set(['abgeschlossen', 'storniert']);
+const WECHSEL = Object.freeze({
+  offen: ['reserviert', 'storniert'],
+  reserviert: ['aktiv', 'storniert'],
+  aktiv: ['abgeschlossen'],
+  abgeschlossen: [],
+  storniert: [],
 });
+const AUTOSTATUS = Object.freeze({
+  offen: 'frei',
+  reserviert: 'reserviert',
+  aktiv: 'vermietet',
+  abgeschlossen: 'frei',
+  storniert: 'frei',
+});
+
+function verborgenesAlias(quelle, type = 'string') {
+  return {
+    field: { type, readonly: true, optional: true, nullable: true, hidden: true },
+    compute: ({ record }) => record[quelle],
+  };
+}
+
+function nachschlagen(resource, idFeld, wertFeld, {
+  type = 'string',
+  hidden = false,
+  label,
+} = {}) {
+  return {
+    field: { type, readonly: true, optional: true, nullable: true, hidden, label },
+    compute: async ({ record, repositories }) => {
+      const id = record[idFeld];
+      if (id == null) return null;
+      return (await repositories[resource].findById(id))?.[wertFeld] ?? null;
+    },
+  };
+}
+
+function dbWert(value) {
+  if (value === undefined || value === null) return null;
+  return typeof value === 'string' ? value : JSON.stringify(value);
+}
+
+function auditWert(value) {
+  if (value === null || value === undefined) return undefined;
+  try { return JSON.parse(value); }
+  catch { return value; }
+}
+
+function protokollFeld(name) {
+  return ({
+    autoId: 'auto_id',
+    kundeId: 'kunde_id',
+    accountId: 'account_id',
+    ausgeliehenAm: 'ausgeliehen_am',
+    zurueckgegebenAm: 'zurueckgegeben_am',
+    erstelltVon: 'erstellt_von',
+    geaendertAm: 'geaendert_am',
+    geaendertVon: 'geaendert_von',
+    gesperrtVon: 'gesperrt_von',
+    gesperrtAm: 'gesperrt_am',
+  })[name] ?? name;
+}
+
+class ProtokollAuditAdapter {
+  constructor(db) {
+    this.database = db;
+  }
+
+  async initialize() {}
+
+  async write(entry) {
+    if (entry.resource !== 'vermietung' || entry.resourceId == null || entry.actorId == null) return;
+
+    let aktion = 'geaendert';
+    if (entry.action === 'erstellt' || entry.action?.endsWith('.create')) aktion = 'erstellt';
+    else if (entry.action?.includes('transition:')) aktion = 'statuswechsel';
+    else if (entry.action === 'zurueckgegeben') aktion = 'zurueckgegeben';
+
+    const namen = new Set([
+      ...Object.keys(entry.oldValues ?? {}),
+      ...Object.keys(entry.newValues ?? {}),
+    ]);
+    let aenderungen = [...namen]
+        .filter((name) => !Object.is(entry.oldValues?.[name], entry.newValues?.[name]))
+        .map((name) => ({
+          feld: protokollFeld(name),
+          alt: entry.oldValues?.[name],
+          neu: entry.newValues?.[name],
+        }));
+
+    if (aktion === 'erstellt') {
+      aenderungen = [{ feld: 'status', alt: null, neu: entry.newValues?.status }];
+    } else if (aktion === 'statuswechsel' || aktion === 'zurueckgegeben') {
+      aenderungen = aenderungen.filter((wert) => wert.feld === 'status');
+    } else {
+      aenderungen = aenderungen.filter((wert) => ['auto_id', 'kunde_id'].includes(wert.feld));
+    }
+
+    // Kein Feld geaendert, kein Eintrag: Eine Zeile ohne Feld und ohne Werte
+    // behauptet eine Aenderung, die es nie gab. Der Endstand schreibt hier
+    // ebenfalls nichts.
+    if (aenderungen.length === 0) return;
+
+    const insert = this.database.prepare(`INSERT INTO protokoll
+                                          (tabelle, datensatz_id, aktion, feld, alter_wert, neuer_wert, account_id, zeitpunkt)
+                                          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+
+    for (const wert of aenderungen) {
+      insert.run(
+          'vermietungen',
+          entry.resourceId,
+          aktion,
+          wert.feld,
+          dbWert(wert.alt),
+          dbWert(wert.neu),
+          entry.actorId,
+          entry.at ?? new Date().toISOString(),
+      );
+    }
+  }
+
+  list({ resource, resourceId, direction = 'asc' } = {}) {
+    if (resource !== undefined && resource !== 'vermietung') return [];
+    const where = resourceId === undefined ? '' : ' WHERE p.datensatz_id = ?';
+    const values = resourceId === undefined ? [] : [resourceId];
+    const order = String(direction).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+    return this.database.prepare(`SELECT
+                                    p.id, p.datensatz_id, p.aktion, p.feld, p.alter_wert,
+                                    p.neuer_wert, p.account_id, p.zeitpunkt, a.name AS person
+                                  FROM protokoll p
+                                         JOIN account a ON a.id = p.account_id${where}
+                                  ORDER BY p.id ${order}`).all(...values).map((row) => {
+      const oldValue = auditWert(row.alter_wert);
+      const newValue = auditWert(row.neuer_wert);
+      return {
+        id: row.id,
+        at: row.zeitpunkt,
+        actorId: row.account_id,
+        action: `vermietung.${row.aktion}`,
+        resource: 'vermietung',
+        resourceId: row.datensatz_id,
+        oldValues: row.feld ? { [row.feld]: oldValue } : undefined,
+        newValues: row.feld ? { [row.feld]: newValue } : undefined,
+        changes: row.feld ? [{ field: row.feld, oldValue, newValue }] : [],
+
+        // Kompatibilitaet mit dem gelieferten Endstand-Frontend.
+        zeitpunkt: row.zeitpunkt,
+        person: row.person,
+        aktion: row.aktion,
+        feld: row.feld,
+        alter_wert: row.alter_wert,
+        neuer_wert: row.neuer_wert,
+      };
+    });
+  }
+}
+
+class KompatiblerEventBus extends MemoryEventBus {
+  async publish(event) {
+    await super.publish(event);
+    if (event?.topic === 'vermietung.changed') {
+      await super.publish({ ...event, topic: 'vermietung-geaendert' });
+    }
+  }
+}
+
+function rolleDes(user) {
+  return user?.role ?? user?.gruppe;
+}
+
+function darfWechseln(user, vermietung, ziel) {
+  const rolle = rolleDes(user);
+  if (!WECHSEL[vermietung.status]?.includes(ziel)) {
+    throw new ConflictError(`Wechsel von ${vermietung.status} nach ${ziel} ist nicht erlaubt`);
+  }
+  if (ziel === 'storniert') {
+    if (rolle !== 'admin') throw new ForbiddenError();
+    if (Number(vermietung.erstelltVon) === Number(user.id)) {
+      throw new ForbiddenError('Eigene Erfassungen duerfen nicht selbst storniert werden (Vier-Augen-Prinzip)');
+    }
+    return;
+  }
+  if (!['mitarbeiter', 'admin'].includes(rolle)) throw new ForbiddenError();
+}
+
+async function statusAendern({ input, repositories, user, transaction, emit }, ziel, audit) {
+  const repo = repositories.vermietung;
+  const aktuell = await repo.findById(input.id);
+  if (!aktuell) throw new NotFoundError('Vermietung nicht gefunden');
+  darfWechseln(user, aktuell, ziel);
+
+  const werte = {
+    status: ziel,
+    geaendertAm: new Date().toISOString(),
+    geaendertVon: user.id,
+    version: aktuell.version,
+    ...(ENDZUSTAENDE.has(ziel) ? { zurueckgegebenAm: new Date().toISOString() } : {}),
+  };
+  const ergebnis = await repo.updateWhere(input.id, werte, { status: aktuell.status });
+  const auto = await repositories.auto.findById(aktuell.autoId);
+  const neuesAuto = await repositories.auto.updateWhere(aktuell.autoId, { status: AUTOSTATUS[ziel] }, { status: auto.status });
+  // Der Autostatus haengt am Vorgangsstatus. Die Autoliste anderer
+  // Arbeitsplaetze soll das sofort sehen und nicht erst beim Polling.
+  emit?.({
+    topic: 'auto.changed',
+    data: { operation: `statuswechsel:${ziel}`, resource: 'auto', value: neuesAuto ?? { ...auto, status: AUTOSTATUS[ziel] } },
+  });
+  await audit.write({
+    at: new Date().toISOString(),
+    actorId: user.id,
+    action: ziel === 'abgeschlossen' ? 'zurueckgegeben' : `vermietung.transition:${ziel}`,
+    resource: 'vermietung',
+    resourceId: input.id,
+    oldValues: aktuell,
+    newValues: ergebnis,
+    transaction,
+  });
+  return ergebnis;
+}
+
+function legacyVermietung(record) {
+  if (!record || typeof record !== 'object') return record;
+  return {
+    ...record,
+    auto_id: record.autoId,
+    kunde_id: record.kundeId,
+    account_id: record.accountId,
+    ausgeliehen_am: record.ausgeliehenAm,
+    zurueckgegeben_am: record.zurueckgegebenAm,
+    erstellt_von: record.erstelltVon,
+    geaendert_am: record.geaendertAm,
+    geaendert_von: record.geaendertVon,
+    gesperrt_von: record.gesperrtVon,
+    gesperrt_am: record.gesperrtAm,
+  };
+}
+
+// Der Endstand beantwortet veraendernde Aufrufe mit { ok: true } und
+// POST /vermietungen mit { id }. Das Framework liefert stattdessen den
+// vollstaendigen Datensatz. Wir senden beides: Der alte Client findet seine
+// Felder (inklusive der Schreibweise mit Unterstrich), die generierte
+// Oberflaeche behaelt Datensatz und version fuer die naechste Bearbeitung.
+const LEGACY_OK_OPERATIONEN = new Set(['update', 'transition', 'lock.acquire', 'lock.release']);
+const LEGACY_OK_ACTIONS = new Set(['statusKompatibel', 'rueckgabeKompatibel']);
+
+function legacyAntwort({ kind, resource, operation, action, result }) {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return undefined;
+  if (kind === 'action') {
+    if (action === 'vermieten') return legacyVermietung(result);
+    return LEGACY_OK_ACTIONS.has(action) ? { ok: true, ...legacyVermietung(result) } : undefined;
+  }
+  if (resource !== 'vermietung' || !LEGACY_OK_OPERATIONEN.has(operation)) return undefined;
+  return { ok: true, ...legacyVermietung(result) };
+}
+
+export function erstelleAutovermietungsConfig(database) {
+  const audit = new ProtokollAuditAdapter(database);
+  const events = new KompatiblerEventBus();
+
+  return defineApp({
+    name: 'autovermietung-modulendstand',
+    database,
+    audit,
+    events,
+    api: {
+      prefix: '/api',
+      eventsPath: '/ereignisse',
+      response: legacyAntwort,
+    },
+    // Wie im Endstand: Ein getrennt laufendes Frontend (anderer Port) darf die
+    // API ansprechen. Fuer den Betrieb ausserhalb der Schulung gehoert hier eine
+    // konkrete Herkunft hin, z. B. { origin: 'https://vermietung.example' }.
+    cors: true,
+    ui: {
+      generated: true,
+      title: 'Autovermietung Flughafen',
+      port: 5173,
+    },
+    migrations: {
+      directory: fileURLToPath(new URL('./migrations-autovermietung', import.meta.url)),
+    },
+    documentation: {
+      // Screenshots und Listen zeigen den aktuellen Datenbestand. Der Lauf
+      // arbeitet auf einer Kopie von vermietung.db; die Datei selbst wird nur
+      // gelesen. Mit 'fixtures' gelten stattdessen die Beispieldaten unten.
+      data: 'live',
+      title: 'Autovermietung Modulendstand',
+      description: 'Mehrbenutzer-Autovermietung mit Transaktionen, Konfliktschutz, Rollen, Audit und Live-Updates.',
+      author: 'M223',
+      directory: fileURLToPath(new URL('./docs/generated', import.meta.url)),
+      // Die Dokumentation arbeitet in einer isolierten Temp-Datenbank. Der
+      // Admin steht absichtlich an erster Stelle: So sind die geschuetzte
+      // Kontenliste und das Bearbeiten einer aktiven Vermietung fuer die
+      // automatischen Screenshots sichtbar, ohne Produktivdaten anzufassen.
+      fixtures: {
+        account: [
+          { benutzername: 'admin-doku', passwort: '1234', name: 'Admin Dokumentation', station: 'Zentrale', gruppe: 'admin' },
+          { benutzername: 'hans-doku', passwort: '1234', name: 'Hans Dokumentation', station: 'Flughafen Schalter 1', gruppe: 'mitarbeiter' },
+        ],
+        kunde: [
+          { vorname: 'Anna', nachname: 'Keller' },
+          { vorname: 'Bruno', nachname: 'Steiner' },
+        ],
+        auto: [
+          { marke: 'VW', modell: 'Golf', kennzeichen: 'ZH DOKU 001', status: 'vermietet' },
+          { marke: 'Skoda', modell: 'Octavia', kennzeichen: 'ZH DOKU 002', status: 'frei' },
+        ],
+        vermietung: [{
+          autoId: 1,
+          kundeId: 1,
+          accountId: 1,
+          ausgeliehenAm: '2026-01-15T09:00:00.000Z',
+          zurueckgegebenAm: null,
+          status: 'aktiv',
+          version: 1,
+          erstelltVon: 1,
+          geaendertAm: null,
+          geaendertVon: null,
+          gesperrtVon: null,
+          gesperrtAm: null,
+        }],
+        protokoll: [{
+          tabelle: 'vermietungen',
+          datensatzId: 1,
+          aktion: 'erstellt',
+          // Ein Eintrag ohne Feld behauptet eine Aenderung, die niemand nachvollziehen
+          // kann. Der Startbestand haelt sich an dieselbe Regel wie die Anwendung.
+          feld: 'status',
+          alterWert: null,
+          neuerWert: 'aktiv',
+          accountId: 1,
+          zeitpunkt: '2026-01-15T09:00:00.000Z',
+        }],
+      },
+    },
+    // Die Szenarien stehen in jeder Konfiguration, nicht nur beim Testlauf:
+    // `sichere-actions docs` traegt sie samt gespeichertem Ergebnis ins
+    // Testprotokoll ein. `reset` und `createConfig` wirken ausschliesslich
+    // waehrend `sichere-actions test` - dieser Lauf arbeitet in einer eigenen
+    // temporaeren Datenbank.
+    tests: {
+      reset: true,
+      output: fileURLToPath(new URL('./.sichere', import.meta.url)),
+      createConfig: ({ database: testDatabase }) => erstelleAutovermietungsConfig(testDatabase),
+      scenarios: fachlicheRegressionen,
+    },
+    auth: {
+      resource: 'account',
+      username: 'benutzername',
+      password: 'passwort',
+      role: 'gruppe',
+      header: 'x-account-id',
+      loginPath: '/login',
+    },
+
+    resources: {
+      account: {
+        table: 'account',
+        path: '/accounts',
+        label: 'Konto',
+        pluralLabel: 'Kontenverwaltung',
+        display: '{name}',
+        operations: { list: true, get: true, create: true, update: true, delete: false },
+        permissions: { read: ['admin'], create: ['admin'], update: ['admin'] },
+        ui: { visibleFor: ['admin'], tableFields: ['benutzername', 'name', 'station', 'gruppe'] },
+        fields: {
+          benutzername: { type: 'string', required: true, unique: true, label: 'Benutzername' },
+          // writeOnly: geht ins Formular hinein, kommt nie aus der API zurueck.
+          passwort: { type: 'string', required: true, writeOnly: true, label: 'Passwort' },
+          name: 'string!',
+          station: 'string!',
+          gruppe: { type: 'enum', values: ['mitarbeiter', 'admin'], required: true, label: 'Gruppe' },
+        },
+      },
+
+      kunde: {
+        table: 'kunden',
+        path: '/kunden',
+        label: 'Kunde',
+        pluralLabel: 'Kunden',
+        display: '{vorname} {nachname}',
+        defaultSort: 'nachname',
+        // Stammdaten duerfen gepflegt werden. Lesen bleibt offen wie im Endstand,
+        // Aenderungen brauchen eine Rolle; Loeschen bleibt der Administration.
+        operations: { list: true, get: true, create: true, update: true, delete: true },
+        permissions: { create: ['mitarbeiter', 'admin'], update: ['mitarbeiter', 'admin'], delete: ['admin'] },
+        ui: { tableFields: ['vorname', 'nachname'] },
+        fields: {
+          vorname: { type: 'string', required: true, label: 'Vorname' },
+          nachname: { type: 'string', required: true, label: 'Nachname', sortable: true },
+        },
+      },
+
+      auto: {
+        table: 'autos',
+        path: '/autos',
+        label: 'Auto',
+        pluralLabel: 'Autos',
+        display: '{marke} {modell} ({kennzeichen})',
+        // status bleibt schreibgeschuetzt: Ihn fuehrt der Vermietungsprozess.
+        operations: { list: true, get: true, create: true, update: true, delete: true },
+        permissions: { create: ['mitarbeiter', 'admin'], update: ['mitarbeiter', 'admin'], delete: ['admin'] },
+        live: { mode: 'both', intervalMs: 30000 },
+        ui: { tableFields: ['marke', 'modell', 'kennzeichen', 'status', 'frei'] },
+        fields: {
+          marke: 'string!',
+          modell: 'string!',
+          kennzeichen: { type: 'string', required: true, unique: true },
+          status: {
+            type: 'string',
+            required: true,
+            default: 'frei',
+            readonly: true,
+          },
+        },
+        computed: {
+          frei: {
+            field: { type: 'int', readonly: true, label: 'Frei' },
+            compute: async ({ record, repositories }) => (
+                await repositories.vermietung.exists({ autoId: record.id, zurueckgegebenAm: null }) ? 0 : 1
+            ),
+          },
+        },
+      },
+
+      vermietung: {
+        table: 'vermietungen',
+        path: '/vermietungen',
+        label: 'Vermietung',
+        pluralLabel: 'Laufende Vorgaenge',
+        display: '{autoId} - {kundeId}',
+        defaultSort: 'id',
+        defaultDirection: 'desc',
+        // Der Endstand fuehrt den Autostatus redundant mit. Beim Wechsel des
+        // Autos gilt: altes Auto frei, neues Auto uebernimmt den Vorgangsstatus
+        // - beides in derselben Transaktion wie die Vermietung selbst.
+        effects: {
+          update: [
+            {
+              resource: 'auto', id: '$previous.autoId', values: { status: 'frei' },
+              when: { ne: ['$previous.autoId', '$record.autoId'] },
+            },
+            {
+              resource: 'auto', id: '$record.autoId',
+              values: ({ record }) => ({ status: AUTOSTATUS[record.status] ?? 'frei' }),
+              when: { ne: ['$previous.autoId', '$record.autoId'] },
+            },
+          ],
+        },
+        operations: { list: true, get: true, create: false, update: true, delete: false },
+        permissions: { update: ['mitarbeiter', 'admin'] },
+        policy: {
+          default: 'deny',
+          rules: [
+            { action: 'read', effect: 'allow' },
+            { action: 'update', roles: ['mitarbeiter'], states: ['offen', 'reserviert'], ownerField: 'erstelltVon' },
+            { action: 'update', roles: ['admin'], states: ['offen', 'reserviert', 'aktiv'] },
+            { action: 'transition:reserviert', roles: ['mitarbeiter', 'admin'], states: ['offen'] },
+            { action: 'transition:aktiv', roles: ['mitarbeiter', 'admin'], states: ['reserviert'] },
+            { action: 'transition:abgeschlossen', roles: ['mitarbeiter', 'admin'], states: ['aktiv'] },
+            { action: 'transition:storniert', roles: ['admin'], states: ['offen', 'reserviert'], notOwnerField: 'erstelltVon' },
+          ],
+        },
+        tracking: {
+          createdAt: 'ausgeliehenAm',
+          updatedAt: 'geaendertAm',
+          createdBy: 'erstelltVon',
+          updatedBy: 'geaendertVon',
+          actorResource: 'account',
+        },
+        audit: true,
+        live: { mode: 'both', intervalMs: 30000 },
+        optimisticLock: { versionField: 'version' },
+        editingLock: {
+          expiresIn: '10m',
+          actorField: 'gesperrtVon',
+          atField: 'gesperrtAm',
+          actorResource: 'account',
+          actorDisplay: '{name}',
+          roles: ['mitarbeiter', 'admin'],
+          overrideRoles: ['admin'],
+          acquireOverrideRoles: [],
+          releaseOverrideRoles: ['admin'],
+          acquirePath: '/sperren',
+          releasePath: '/entsperren',
+          acquireMethod: 'post',
+          releaseMethod: 'post',
+        },
+        historyPath: '/verlauf',
+        indexes: [
+          {
+            name: 'idx_auto_einmal_offen',
+            fields: ['autoId'],
+            unique: true,
+            where: { zurueckgegebenAm: null },
+          },
+        ],
+        ui: {
+          tableFields: ['autoId', 'kundeId', 'mitarbeiter', 'status', 'ausgeliehenAm'],
+        },
+        fields: {
+          autoId: {
+            type: 'reference', target: 'auto', required: true, column: 'auto_id',
+            label: 'Auto', display: '{marke} {modell} ({kennzeichen})',
+          },
+          kundeId: {
+            type: 'reference', target: 'kunde', required: true, column: 'kunde_id',
+            label: 'Kunde', display: '{vorname} {nachname}',
+          },
+          accountId: {
+            type: 'reference', target: 'account', required: true, column: 'account_id',
+            readonly: true, hidden: true,
+          },
+          ausgeliehenAm: {
+            type: 'datetime', required: true, column: 'ausgeliehen_am', readonly: true,
+            label: 'Ausgeliehen am',
+          },
+          zurueckgegebenAm: {
+            type: 'datetime', optional: true, nullable: true, column: 'zurueckgegeben_am',
+            readonly: true, hidden: true,
+          },
+          status: {
+            type: 'enum', values: STATUS, default: 'offen', readonly: true, required: true,
+          },
+          version: { type: 'int', default: 1, readonly: true, required: true },
+          erstelltVon: {
+            type: 'reference', target: 'account', optional: true, nullable: true,
+            column: 'erstellt_von', readonly: true, hidden: true,
+          },
+          geaendertAm: {
+            type: 'datetime', optional: true, nullable: true,
+            column: 'geaendert_am', readonly: true, hidden: true,
+          },
+          geaendertVon: {
+            type: 'reference', target: 'account', optional: true, nullable: true,
+            column: 'geaendert_von', readonly: true, hidden: true,
+          },
+          gesperrtVon: {
+            type: 'reference', target: 'account', optional: true, nullable: true,
+            column: 'gesperrt_von', readonly: true, hidden: true,
+          },
+          gesperrtAm: {
+            type: 'datetime', optional: true, nullable: true,
+            column: 'gesperrt_am', readonly: true, hidden: true,
+          },
+        },
+        computed: {
+          auto_id: verborgenesAlias('autoId', 'int'),
+          kunde_id: verborgenesAlias('kundeId', 'int'),
+          account_id: verborgenesAlias('accountId', 'int'),
+          ausgeliehen_am: verborgenesAlias('ausgeliehenAm', 'datetime'),
+          zurueckgegeben_am: verborgenesAlias('zurueckgegebenAm', 'datetime'),
+          erstellt_von: verborgenesAlias('erstelltVon', 'int'),
+          geaendert_am: verborgenesAlias('geaendertAm', 'datetime'),
+          geaendert_von: verborgenesAlias('geaendertVon', 'int'),
+          gesperrt_von: verborgenesAlias('gesperrtVon', 'int'),
+          gesperrt_am: verborgenesAlias('gesperrtAm', 'datetime'),
+          marke: nachschlagen('auto', 'autoId', 'marke', { hidden: true }),
+          modell: nachschlagen('auto', 'autoId', 'modell', { hidden: true }),
+          kennzeichen: nachschlagen('auto', 'autoId', 'kennzeichen', { hidden: true }),
+          vorname: nachschlagen('kunde', 'kundeId', 'vorname', { hidden: true }),
+          nachname: nachschlagen('kunde', 'kundeId', 'nachname', { hidden: true }),
+          mitarbeiter: nachschlagen('account', 'accountId', 'name', { label: 'Mitarbeiter' }),
+          station: nachschlagen('account', 'accountId', 'station', { hidden: true }),
+          gesperrtVonName: nachschlagen('account', 'gesperrtVon', 'name', { hidden: true }),
+          gesperrt_von_name: nachschlagen('account', 'gesperrtVon', 'name', { hidden: true }),
+          geaendert_von_name: nachschlagen('account', 'geaendertVon', 'name', { hidden: true }),
+        },
+        workflow: {
+          field: 'status',
+          initial: 'offen',
+          endpoint: {
+            path: '/workflow-status',
+            method: 'post',
+            field: 'status',
+            exclusive: true,
+          },
+          transitions: {
+            reserviert: {
+              from: 'offen', to: 'reserviert', label: 'Reservieren',
+              roles: ['mitarbeiter', 'admin'],
+              effects: [{ resource: 'auto', id: '$resource.autoId', values: { status: 'reserviert' } }],
+            },
+            aktiv: {
+              from: 'reserviert', to: 'aktiv', label: 'Herausgeben',
+              roles: ['mitarbeiter', 'admin'],
+              effects: [{ resource: 'auto', id: '$resource.autoId', values: { status: 'vermietet' } }],
+            },
+            abgeschlossen: {
+              from: 'aktiv', to: 'abgeschlossen', label: 'Zurueckgeben',
+              roles: ['mitarbeiter', 'admin'],
+              values: () => ({ zurueckgegebenAm: new Date().toISOString() }),
+              effects: [{ resource: 'auto', id: '$resource.autoId', values: { status: 'frei' } }],
+            },
+            storniert: {
+              from: ['offen', 'reserviert'], to: 'storniert', label: 'Stornieren',
+              roles: ['admin'],
+              authorize: ({ user, resource }) => Number(resource.erstelltVon) !== Number(user.id),
+              values: () => ({ zurueckgegebenAm: new Date().toISOString() }),
+              effects: [{ resource: 'auto', id: '$resource.autoId', values: { status: 'frei' } }],
+            },
+          },
+        },
+      },
+
+      protokoll: {
+        table: 'protokoll',
+        label: 'Protokolleintrag',
+        pluralLabel: 'Protokoll',
+        operations: { list: false, get: false, create: false, update: false, delete: false },
+        ui: { hidden: true },
+        documentation: { hidden: true },
+        fields: {
+          tabelle: 'string!',
+          datensatzId: { type: 'int', required: true, column: 'datensatz_id' },
+          aktion: 'string!',
+          feld: { type: 'string', optional: true, nullable: true },
+          alterWert: { type: 'string', optional: true, nullable: true, column: 'alter_wert' },
+          neuerWert: { type: 'string', optional: true, nullable: true, column: 'neuer_wert' },
+          accountId: { type: 'reference', target: 'account', required: true, column: 'account_id' },
+          zeitpunkt: 'datetime!',
+        },
+      },
+    },
+
+    actions: {
+      vermieten: ({ resources }) => ({
+        path: '/vermietungen',
+        method: 'post',
+        roles: ['mitarbeiter', 'admin'],
+        successStatus: 201,
+        transaction: true,
+        input: {
+          autoId: {
+            type: 'reference', target: 'auto', required: true, lock: true,
+            label: 'Auto', display: '{marke} {modell} ({kennzeichen})', where: { frei: 1 },
+          },
+          kundeId: {
+            type: 'reference', target: 'kunde', required: true,
+            label: 'Kunde', display: '{vorname} {nachname}',
+          },
+          sofort: {
+            type: 'boolean', default: true,
+            label: 'Sofort herausgeben',
+            description: 'Deaktiviert bedeutet: nur reservieren.',
+          },
+        },
+        require: [
+          notExists({
+            resource: resources.vermietung,
+            where: ({ autoId }) => ({ autoId, zurueckgegebenAm: null }),
+            error: conflict('Dieses Auto ist bereits vermietet', { code: 'AUTO_BELEGT' }),
+          }),
+        ],
+        create: {
+          resource: resources.vermietung,
+          values: ({ input, user }) => ({
+            autoId: input.autoId,
+            kundeId: input.kundeId,
+            accountId: user.id,
+            zurueckgegebenAm: null,
+            status: input.sofort === false ? 'reserviert' : 'aktiv',
+          }),
+        },
+        effects: [
+          {
+            resource: resources.auto,
+            id: '$input.autoId',
+            values: ({ input }) => ({ status: input.sofort === false ? 'reserviert' : 'vermietet' }),
+          },
+        ],
+        audit: { action: 'erstellt' },
+        publish: ({ result }) => ({
+          topic: 'vermietung.changed',
+          data: { operation: 'create', resource: 'vermietung', value: result },
+        }),
+        documentation: {
+          label: 'Neue Vermietung',
+          summary: 'Auto vermieten oder reservieren',
+          description: 'Ein freies Auto wird transaktional vermietet oder reserviert.',
+          successMessage: 'Vermietung erfasst.',
+        },
+      }),
+
+      statusKompatibel: {
+        path: '/vermietungen/:id/status',
+        method: 'post',
+        roles: ['mitarbeiter', 'admin'],
+        transaction: true,
+        input: {
+          id: { type: 'int', required: true, source: param('id'), hidden: true },
+          status: { type: 'enum', values: STATUS, required: true },
+        },
+        execute: (context) => statusAendern(context, context.input.status, audit),
+        publish: ({ result }) => ({
+          topic: 'vermietung.changed',
+          data: { operation: 'statuswechsel', resource: 'vermietung', value: result },
+        }),
+        documentation: { hidden: true, summary: 'Kompatibler Statusendpunkt' },
+      },
+
+      rueckgabeKompatibel: {
+        path: '/vermietungen/:id/rueckgabe',
+        method: 'post',
+        roles: ['mitarbeiter', 'admin'],
+        transaction: true,
+        input: {
+          id: { type: 'int', required: true, source: param('id'), hidden: true },
+        },
+        execute: (context) => statusAendern(context, 'abgeschlossen', audit),
+        publish: ({ result }) => ({
+          topic: 'vermietung.changed',
+          data: { operation: 'zurueckgegeben', resource: 'vermietung', value: result },
+        }),
+        documentation: { hidden: true, summary: 'Kompatibler Rueckgabeendpunkt' },
+      },
+    },
+
+    configure({ app }) {
+      // Das Endstand-Frontend erwartet die alten Felder `fehler` und `details`.
+      // Die Framework-Felder bleiben parallel erhalten, damit die generierte UI
+      // und externe Clients weiterhin den stabilen Fehlercode verwenden koennen.
+      app.use((error, req, res, next) => {
+        if (res.headersSent) return next(error);
+        // Unbekannte Fehler duerfen nichts ueber ihr Innenleben verraten. Der
+        // Text ist derselbe wie im Endstand, damit auch ein 500 als `fehler`
+        // ankommt und nicht als "Unbekannter Fehler" im Frontend landet.
+        if (!(error instanceof HttpError)) {
+          console.error(error);
+          return res.status(500).json({
+            fehler: 'Interner Serverfehler',
+            code: 'INTERNAL_ERROR',
+            message: 'Interner Serverfehler',
+            error: { code: 'INTERNAL_ERROR', message: 'Interner Serverfehler' },
+          });
+        }
+        const original = error.details ?? {};
+        let details = original;
+
+        if (error.status === 409 && /Eindeutiger Wert bereits vorhanden/i.test(error.message)) {
+        // Der partielle UNIQUE-Index laesst nur eine offene Vermietung je Auto
+        // zu. Der Endstand nennt diesen Fall AUTO_BELEGT.
+        return res.status(409).json({
+          fehler: 'Dieses Auto ist bereits vermietet',
+          details: { code: 'AUTO_BELEGT' },
+          code: 'CONFLICT',
+          message: 'Dieses Auto ist bereits vermietet',
+          error: { code: 'CONFLICT', message: 'Dieses Auto ist bereits vermietet', details: { code: 'AUTO_BELEGT' } },
+          conflict: { code: 'AUTO_BELEGT' },
+        });
+      }
+      if (error.status === 409 && (original.currentData || original.current)) {
+          const aktuell = legacyVermietung(original.currentData ?? original.current);
+          details = {
+            ...original,
+            code: 'VERSIONSKONFLIKT',
+            aktuelleVersion: original.currentVersion ?? aktuell.version,
+            geaendertAm: original.changedAt ?? aktuell.geaendert_am,
+            geaendertVon: original.changedByName ?? original.changedByActor?.name,
+            aktuelleDaten: aktuell,
+          };
+        } else if (error.status === 423) {
+          const rest = Math.max(0, Date.parse(original.expiresAt) - Date.now());
+          details = {
+            ...original,
+            code: 'GESPERRT',
+            gesperrtVon: original.actorName ?? original.actor?.name ?? original.ownerId,
+            gesperrtAm: original.lockedAt,
+            gueltigNochMinuten: Math.round(rest / 60000),
+          };
+        }
+
+        res.status(error.status).json({
+          fehler: error.message,
+          details,
+          code: error.code,
+          message: error.message,
+          error: { code: error.code, message: error.message, details },
+          ...(error.status === 409 ? { conflict: details } : {}),
+        });
+      });
+    },
+
+    seed: {
+      account: [
+        { benutzername: 'hans', passwort: '1234', name: 'Hans Meier', station: 'Flughafen Schalter 1', gruppe: 'mitarbeiter' },
+        { benutzername: 'paul', passwort: '1234', name: 'Paul Weber', station: 'Flughafen Schalter 2', gruppe: 'mitarbeiter' },
+        { benutzername: 'admin', passwort: '1234', name: 'Admin Person', station: 'Zentrale', gruppe: 'admin' },
+      ],
+      kunde: [
+        { vorname: 'Anna', nachname: 'Keller' },
+        { vorname: 'Bruno', nachname: 'Steiner' },
+        { vorname: 'Carla', nachname: 'Frei' },
+      ],
+      auto: [
+        { marke: 'VW', modell: 'Golf', kennzeichen: 'ZH 100 001', status: 'vermietet' },
+        { marke: 'Skoda', modell: 'Octavia', kennzeichen: 'ZH 100 002', status: 'frei' },
+        { marke: 'Fiat', modell: 'Panda', kennzeichen: 'ZH 100 003', status: 'frei' },
+      ],
+      vermietung: () => [{
+        autoId: 1,
+        kundeId: 1,
+        accountId: 1,
+        ausgeliehenAm: new Date().toISOString(),
+        zurueckgegebenAm: null,
+        status: 'aktiv',
+        version: 1,
+        erstelltVon: 1,
+        geaendertAm: null,
+        geaendertVon: null,
+        gesperrtVon: null,
+        gesperrtAm: null,
+      }],
+      protokoll: () => [{
+        tabelle: 'vermietungen',
+        datensatzId: 1,
+        aktion: 'erstellt',
+        feld: 'status',
+        alterWert: null,
+        neuerWert: 'aktiv',
+        accountId: 1,
+        zeitpunkt: new Date().toISOString(),
+      }],
+    },
+  });
+}
+
+export default ({ database } = {}) => erstelleAutovermietungsConfig(
+    database ?? sqlite(PRODUKTIONS_DATENBANK, { journalMode: 'WAL', busyTimeout: 5000 }),
+);

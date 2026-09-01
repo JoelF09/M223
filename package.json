@@ -8,25 +8,27 @@
   "scripts": {
     "dev": "sichere-actions dev",
     "start": "sichere-actions dev",
+    "setup": "npm install && playwright install chromium && npm run db:migrate && npm run seed && npm test && npm run docs",
     "build": "sichere-actions build",
     "seed": "sichere-actions seed --reset",
+    "db:create": "sichere-actions migration:create --name initial",
+    "db:migrate": "sichere-actions migration:run",
     "test": "sichere-actions test",
     "db:update": "sichere-actions migration:create --name update && sichere-actions migration:run",
     "docs": "sichere-actions docs",
-    "sql": "sichere-actions sql",
-    "postinstall": "patch-package"
+    "pruefung": "npm run setup && sichere-actions dev"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",
     "express": "^5.2.1",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
-    "sichere-express-actions": "^2.5.0",
+    "sichere-express-actions": "^2.6.3",
     "zod": "^4.0.0"
   },
   "devDependencies": {
-    "patch-package": "^8.0.1",
     "playwright": "^1.62.1",
     "vite": "^8.2.2"
-  }
+  },
+  "description": "Pruefungstemplate fuer eine sichere Mehrbenutzer-Autovermietung"
 }
