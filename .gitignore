@@ -430,6 +430,7 @@ FodyWeavers.xsd
 
 # Generated project files
 docs/
-data.db
-data.db-shm
-data.db-wal
+vermietung.db
+vermietung.db-shm
+vermietung.db-wal
+.sichere
